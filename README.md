@@ -1,24 +1,27 @@
-# NexusNet-PasarGuard# PasarGuard Manager (`pg-m`)
+# PasarGuard Manager (`pg-m`)
 
 **A powerful, clean and fully English terminal menu for PasarGuard Panel & Node.**
 
-Inspired by 3x-ui / Sanaei style menus — built to make managing PasarGuard easy, fast and professional.
+Inspired by 3x-ui / Sanaei style menus — built to make managing PasarGuard easy and professional.
+
+**Version 1.1.0**
 
 ---
 
 ## Features
 
-| Category              | Options                                      |
-|-----------------------|----------------------------------------------|
-| **Service**           | Start / Stop / Restart / Status / Logs       |
-| **Install**           | TimescaleDB, PostgreSQL, SQLite, MySQL, MariaDB |
-| **Update / Uninstall**| One-click update & clean uninstall           |
-| **SSL & Domain**      | Let's Encrypt + view/edit SSL settings       |
-| **Backup & Restore**  | Official backup, Telegram auto-backup, restore |
-| **Panel Settings**    | Temp-key, edit .env, edit compose, DB info   |
-| **Node Management**   | Install node (default / custom name)         |
-| **Firewall**          | UFW rules + BBR                              |
-| **Tools**             | Speedtest, disk, memory, ports, Docker clean |
+| Category | Options |
+|----------|---------|
+| **Service** | Start / Stop / Restart / Status / Logs |
+| **Install** | TimescaleDB, PostgreSQL, SQLite, MySQL, MariaDB |
+| **Update / Uninstall** | One-click update & clean uninstall |
+| **SSL & Domain** | Let's Encrypt + Self-Signed + view/edit SSL |
+| **Backup & Restore** | Official backup, Telegram auto-backup, restore, manual DB dump |
+| **Migrate** | Full migration package for new server |
+| **Panel Settings** | Temp-key, Change Port, edit .env/compose, DB password reset |
+| **Node Management** | Install node, Show API Key, Show Certificate, edit node .env |
+| **Firewall** | UFW rules + BBR + Fail2Ban |
+| **Tools** | Speedtest, disk, memory, ports, Docker clean, Geo files, system info |
 
 ---
 
@@ -28,15 +31,7 @@ Inspired by 3x-ui / Sanaei style menus — built to make managing PasarGuard eas
 bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/install.sh)
 ```
 
-Or from this repository:
-
-```bash
-git clone https://github.com/SiNaKeEn/NexusNet-PasarGuard.git
-cd NexusNet-PasarGuard/Manager
-bash install.sh
-```
-
-After installation just run:
+After installation:
 
 ```bash
 pg-m
@@ -44,22 +39,23 @@ pg-m
 
 ---
 
-## Screenshots (Menu Preview)
+## Menu Preview
 
 ```
 ╔══════════════════════════════════════════════════════════╗
-║              PasarGuard Manager  v1.0.0                  ║
+║           PasarGuard Manager  v1.1.0                     ║
 ╚══════════════════════════════════════════════════════════╝
 
   1)  Service Management
   2)  Install / Update / Uninstall
   3)  SSL & Domain Management
   4)  Backup & Restore
-  5)  Panel Settings
-  6)  Node Management
-  7)  Firewall & Security
-  8)  Tools
-  9)  Quick Status
+  5)  Migrate to New Server
+  6)  Panel Settings
+  7)  Node Management
+  8)  Firewall & Security
+  9)  Tools
+  10) Quick Status
   0)  Exit
 ```
 
@@ -75,9 +71,9 @@ pg-m
 
 ## Notes
 
-- All text inside the terminal is **English only** (no Persian characters).
-- The menu is a frontend for official `pasarguard` and `pg-node` commands.
-- It stays compatible with future official updates.
+- All text inside the terminal is **English only**.
+- Frontend for official `pasarguard` and `pg-node` commands.
+- Compatible with future official updates.
 
 ---
 
@@ -92,7 +88,5 @@ rm -f /usr/local/bin/pg-m
 ## License
 
 MIT
-
----
 
 **Made for the PasarGuard community**
