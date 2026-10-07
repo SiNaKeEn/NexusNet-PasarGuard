@@ -1,10 +1,11 @@
+[Uploading README.md…]()
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal management menu for PasarGuard Panel & Node
 
-**Version 1.9.0**
+**Version 1.10.0**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -34,8 +35,9 @@ pg-m
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v1.9.0                   │
-│          https://panel.example.com/dashboard/                │
+│                 PasarGuard Manager  v1.10.0                  │
+│  Panel:UP  DB:UP                                             │
+│  https://panel.example.com/dashboard/                        │
 ├──────────────────────────────────────────────────────────────┤
 │  0. Exit                                                     │
 │──────────────────────────────────────────────────────────────│
@@ -44,14 +46,15 @@ pg-m
 │  3. Panel Settings              (Port / Path / Admin...)     │
 │  4. SSL Certificate Management                               │
 │  5. Backup & Restore                                         │
-│  6. Migrate to New Server                                    │
+│  6. Migrate to New Server       (Full Auto Transfer)         │
 │──────────────────────────────────────────────────────────────│
 │  7. Node Management                                          │
 │  8. Firewall & Security                                      │
-│  9. Database Management                                      │
+│  9. Database Management         (Fix PG / Recover)           │
 │──────────────────────────────────────────────────────────────│
-│ 10. Tools & Utilities                                        │
+│ 10. Tools & Utilities           (Swap / Cleanup / Speed)     │
 │ 11. Quick Status                                             │
+│ 12. Subscription Relay / Tunnel                              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,11 +71,12 @@ Panel URL is shown at the top of the menu when installed.
 | **Port** | Change port • Open firewall • Show access links |
 | **SSL** | Let's Encrypt (one domain) • Self-Signed • List & Expiry • Renew • Delete/Revoke • Apply to Panel • Full cert content view |
 | **Backup** | Manual backup • Telegram auto-backup • Restore • PostgreSQL dump |
-| **Migrate** | **Full automatic transfer to new VPS** (package + SCP + remote install + restore) |
+| **Migrate** | **Full automatic transfer to new VPS** (aggressive clean + volume fix + package + SCP + remote install) |
 | **Settings** | Temp owner key • Edit `.env` / compose • DB password reset |
 | **Node** | Install node • Show API Key • Show certificates • Multi-name support |
 | **Security** | UFW • BBR • Fail2Ban • IP Limit (lock panel to your IP) |
-| **Tools** | Speedtest • Disk/Mem/Ports • Docker cleanup • Geo files • Who uses port 80 |
+| **Database** | Show URL • Reset password • Dump • **Fix PostgreSQL / Recover (initdb error)** |
+| **Tools** | Speedtest • Disk/Mem/Swap • Docker cleanup • Geo files • **Create 2G Swap** |
 
 ---
 
