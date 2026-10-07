@@ -5,7 +5,7 @@
 
 ### x-ui style terminal management menu for PasarGuard Panel & Node
 
-**Version 1.10.0**
+**Version 1.11.1**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -35,7 +35,7 @@ pg-m
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v1.10.0                  │
+│                 PasarGuard Manager  v1.11.1                  │
 │  Panel:UP  DB:UP                                             │
 │  https://panel.example.com/dashboard/                        │
 ├──────────────────────────────────────────────────────────────┤
