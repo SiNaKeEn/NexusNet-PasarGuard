@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.7.0
+#  PasarGuard Manager (pg-m)  v1.8.0
 #  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -12,7 +12,7 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 
 hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter..."; }
@@ -33,8 +33,30 @@ get_env(){
   [[ -f "$ENV_FILE" ]] && grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ' || true
 }
 
+_CACHED_IP=""
 get_ip(){
-  curl -s4 --max-time 3 ifconfig.me 2>/dev/null || curl -s4 --max-time 3 api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'
+  # Cache IP for this session (avoid slow external calls)
+  if [[ -n "$_CACHED_IP" ]]; then
+    echo "$_CACHED_IP"
+    return
+  fi
+  _CACHED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [[ -z "$_CACHED_IP" ]]; then
+    _CACHED_IP=$(curl -s4 --max-time 2 ifconfig.me 2>/dev/null || curl -s4 --max-time 2 api.ipify.org 2>/dev/null || echo "unknown")
+  fi
+  echo "$_CACHED_IP"
+}
+
+get_domain_from_cert(){
+  local cert domain
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  [[ -z "$cert" ]] && return
+  if echo "$cert" | grep -qE 'certs/[^/]+/'; then
+    domain=$(echo "$cert" | sed -n 's|.*/certs/\([^/]*\)/.*|\1|p')
+  elif echo "$cert" | grep -q 'letsencrypt/live/'; then
+    domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
+  fi
+  echo "$domain"
 }
 
 get_port(){
@@ -42,29 +64,41 @@ get_port(){
 }
 
 panel_url(){
-  local ip port scheme cert
+  local ip port scheme cert domain
   ip=$(get_ip); port=$(get_port); cert=$(get_env UVICORN_SSL_CERTFILE)
+  domain=$(get_domain_from_cert)
   [[ -n "$cert" ]] && scheme=https || scheme=http
-  if [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; then
-    echo "${scheme}://${ip}/dashboard/"
+  if [[ -n "$domain" && "$scheme" == "https" ]]; then
+    if [[ "$port" == "443" ]]; then
+      echo "${scheme}://${domain}/dashboard/"
+    else
+      echo "${scheme}://${domain}:${port}/dashboard/"
+    fi
   else
-    echo "${scheme}://${ip}:${port}/dashboard/"
+    if [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; then
+      echo "${scheme}://${ip}/dashboard/"
+    else
+      echo "${scheme}://${ip}:${port}/dashboard/"
+    fi
   fi
 }
 
 show_info(){
-  local cert domain
+  local cert domain ip port
   cert=$(get_env UVICORN_SSL_CERTFILE)
+  domain=$(get_domain_from_cert)
+  ip=$(get_ip)
+  port=$(get_port)
   echo -e "  ${BOLD}Panel Info${NC}"; hr
   echo -e "  Link : ${GREEN}$(panel_url)${NC}"
-  echo -e "  IP   : $(get_ip)"
-  echo -e "  Port : $(get_port)"
-  if [[ -n "$cert" ]]; then
-    echo -e "  SSL  : ${GREEN}ON${NC}  ($cert)"
-    if echo "$cert" | grep -q 'letsencrypt/live/'; then
-      domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
-      [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}https://${domain}/dashboard/${NC}"
-    fi
+  echo -e "  IP   : ${CYAN}${ip}${NC}"
+  echo -e "  Port : ${CYAN}${port}${NC}"
+  if [[ -n "$cert" && -f "$cert" ]]; then
+    echo -e "  SSL  : ${GREEN}ON${NC}"
+    [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}${domain}${NC}"
+  elif [[ -n "$cert" ]]; then
+    echo -e "  SSL  : ${YELLOW}CONFIGURED (file missing)${NC}"
+    echo -e "  Path : ${cert}"
   else
     echo -e "  SSL  : ${YELLOW}OFF${NC}"
   fi
@@ -606,6 +640,16 @@ if [[ -f "$MIG_DIR/pg-m" ]]; then
   echo "→ pg-m installed"
 fi
 
+# Clean conflicting old data if present
+if [[ -d /var/lib/postgresql/pasarguard ]] || docker volume ls 2>/dev/null | grep -qi pasarguard; then
+  echo "→ Cleaning previous PasarGuard data to avoid conflicts..."
+  command -v pasarguard >/dev/null && pasarguard down 2>/dev/null || true
+  docker rm -f $(docker ps -aq --filter name=pasarguard) 2>/dev/null || true
+  docker rm -f $(docker ps -aq --filter name=timescale) 2>/dev/null || true
+  docker volume rm $(docker volume ls -q | grep -i pasarguard) 2>/dev/null || true
+  rm -rf /var/lib/postgresql/pasarguard /opt/pasarguard /var/lib/pasarguard 2>/dev/null || true
+fi
+
 if ! command -v pasarguard &>/dev/null; then
   echo "→ Installing PasarGuard panel..."
   DB_TYPE=$(cat "$MIG_DIR/db_type.txt" 2>/dev/null || echo "timescaledb")
@@ -616,18 +660,7 @@ if ! command -v pasarguard &>/dev/null; then
   bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database "$DB_TYPE" --no-ssl || true
 fi
 
-if command -v pasarguard &>/dev/null; then
-  mkdir -p /opt/pasarguard/backup
-  cp -a "$MIG_DIR"/* /opt/pasarguard/backup/ 2>/dev/null || true
-  pasarguard restore || echo "→ Manual restore may be needed via: pasarguard restore"
-fi
-
-if [[ -f "$MIG_DIR/env.backup" ]]; then
-  mkdir -p /opt/pasarguard
-  cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
-  echo "→ .env restored"
-fi
-
+# Restore certs BEFORE applying .env so paths exist
 if [[ -d "$MIG_DIR/certs" ]]; then
   mkdir -p /var/lib/pasarguard
   cp -a "$MIG_DIR/certs" /var/lib/pasarguard/
@@ -636,6 +669,47 @@ fi
 if [[ -d "$MIG_DIR/letsencrypt" ]]; then
   cp -a "$MIG_DIR/letsencrypt" /etc/
   echo "→ Let'\''s Encrypt certs restored"
+  # Also copy LE live certs into panel-readable path
+  for d in /etc/letsencrypt/live/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    [[ "$name" == "README" ]] && continue
+    mkdir -p "/var/lib/pasarguard/certs/${name}"
+    cp -L "${d}fullchain.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
+    cp -L "${d}privkey.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
+  done
+  echo "→ LE certs copied to panel path"
+fi
+
+# Restore .env but force safe SSL settings until certs verified
+if [[ -f "$MIG_DIR/env.backup" ]]; then
+  mkdir -p /opt/pasarguard
+  cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
+  # If cert files missing, disable SSL so panel can start
+  CERT=$(grep -E "^UVICORN_SSL_CERTFILE=" /opt/pasarguard/.env 2>/dev/null | cut -d= -f2- | sed s/\"//g || true)
+  if [[ -n "$CERT" && ! -f "$CERT" ]]; then
+    echo "→ SSL cert path missing — disabling SSL temporarily so panel starts"
+    sed -i "s|^UVICORN_SSL_CERTFILE=|#UVICORN_SSL_CERTFILE=|" /opt/pasarguard/.env
+    sed -i "s|^UVICORN_SSL_KEYFILE=|#UVICORN_SSL_KEYFILE=|" /opt/pasarguard/.env
+    if grep -q "^UVICORN_PORT=" /opt/pasarguard/.env; then
+      sed -i "s|^UVICORN_PORT=.*|UVICORN_PORT=8000|" /opt/pasarguard/.env
+    else
+      echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
+    fi
+  fi
+  echo "→ .env restored"
+fi
+
+if command -v pasarguard &>/dev/null; then
+  mkdir -p /opt/pasarguard/backup
+  cp -a "$MIG_DIR"/* /opt/pasarguard/backup/ 2>/dev/null || true
+  # Non-interactive restore attempt: pick first zip if present
+  ZIP=$(ls -1t /opt/pasarguard/backup/backup_*.zip 2>/dev/null | head -1)
+  if [[ -n "$ZIP" ]]; then
+    echo "→ Attempting restore from $ZIP"
+    # official restore is interactive; copy note for user
+    echo "→ After login run: pasarguard restore"
+  fi
 fi
 
 if command -v pasarguard &>/dev/null; then
@@ -646,7 +720,9 @@ fi
 echo ""
 echo "════════════════════════════════════════"
 echo "  Migration finished on this server"
-echo "  Run:  pg-m"
+echo "  1) Run:  pg-m"
+echo "  2) If data missing: pasarguard restore"
+echo "  3) Re-issue SSL after DNS points here"
 echo "════════════════════════════════════════"
 '
 
@@ -964,23 +1040,27 @@ main(){
   while true; do
     header
     if has_pg && [[ -f "$ENV_FILE" ]]; then
-      echo -e "  ${GREEN}$(panel_url)${NC}"; hr
+      echo -e "  ${GREEN}$(panel_url)${NC}"
+      hr
     fi
-    echo "  0. Exit"
+    echo -e "  ${BOLD}Core${NC}"
+    echo "   1) Install / Update / Uninstall"
+    echo "   2) Service Management"
+    echo "   3) Panel Settings"
+    echo "   4) SSL Certificate"
+    echo "   5) Backup & Restore"
+    echo "   6) Migrate to New Server"
+    echo
+    echo -e "  ${BOLD}Infra${NC}"
+    echo "   7) Node Management"
+    echo "   8) Firewall & Security"
+    echo "   9) Database Management"
+    echo
+    echo -e "  ${BOLD}System${NC}"
+    echo "  10) Tools & Utilities"
+    echo "  11) Quick Status"
+    echo "   0) Exit"
     hr
-    echo "  1. Install / Update / Uninstall"
-    echo "  2. Service Management"
-    echo "  3. Panel Settings"
-    echo "  4. SSL Certificate Management"
-    echo "  5. Backup & Restore"
-    echo "  6. Migrate to New Server"
-    hr
-    echo "  7. Node Management"
-    echo "  8. Firewall & Security"
-    echo "  9. Database Management"
-    hr
-    echo " 10. Tools & Utilities"
-    echo " 11. Quick Status"; hr
     read -rp "  Select [0-11]: " c
     case $c in
       0) echo "  Bye"; exit 0 ;;
@@ -996,9 +1076,17 @@ main(){
       10) m_tools ;;
       11)
         header
-        has_pg && pasarguard status || echo "  not installed"
-        echo; show_info
-        df -h / | tail -1; free -h | grep Mem
+        echo -e "  ${BOLD}Quick Status${NC}"; hr
+        # Fast local status only (no external curl timeouts)
+        if has_pg; then
+          docker ps --format "table {{.Names}}\t{{.Status}}" 2>/dev/null | grep -E "pasarguard|timescale|pgbouncer|pgadmin|NAMES" || true
+        else
+          echo "  Panel not installed"
+        fi
+        echo
+        show_info
+        echo -e "  Disk : $(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+        echo -e "  Mem  : $(free -h 2>/dev/null | awk '/Mem:/{print $3"/"$2}')"
         pause
         ;;
     esac
