@@ -1,11 +1,11 @@
-[README.md](https://github.com/user-attachments/files/33139585/README.md)
+[README.md](https://github.com/user-attachments/files/33140289/README.md)
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal management menu for PasarGuard Panel & Node
 
-**Version 1.6.0**
+**Version 1.7.0**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -34,22 +34,26 @@ pg-m
 ## 📋 Menu Overview
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              PasarGuard Manager  v1.5.0              │
-├──────────────────────────────────────────────────────┤
-│  0. Service Management     (Start/Stop/Restart/Logs) │
-│  1. Install / Update / Uninstall                     │
-│  2. Port & Access Links                              │
-│  3. SSL Certificate Management                       │
-│  4. Backup & Restore                                 │
-│  5. Migrate to New Server     ← Full Auto Transfer   │
-│  6. Panel Settings                                   │
-│  7. Node Management                                  │
-│  8. Firewall & IP Limit                              │
-│  9. Tools                                            │
-│ 10. Quick Status                                     │
-│ 11. Exit                                             │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                 PasarGuard Manager  v1.7.0                   │
+│          https://panel.example.com/dashboard/                │
+├──────────────────────────────────────────────────────────────┤
+│  0. Exit                                                     │
+│──────────────────────────────────────────────────────────────│
+│  1. Install / Update / Uninstall                             │
+│  2. Service Management          (Start / Stop / Restart...)  │
+│  3. Panel Settings              (Port / Path / Admin...)     │
+│  4. SSL Certificate Management                               │
+│  5. Backup & Restore                                         │
+│  6. Migrate to New Server                                    │
+│──────────────────────────────────────────────────────────────│
+│  7. Node Management                                          │
+│  8. Firewall & Security                                      │
+│  9. Database Management                                      │
+│──────────────────────────────────────────────────────────────│
+│ 10. Tools & Utilities                                        │
+│ 11. Quick Status                                             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 Panel URL is shown at the top of the menu when installed.
