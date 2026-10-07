@@ -1,9 +1,9 @@
-[README.md](https://github.com/user-attachments/files/33137015/README.md)
+[Uploading README.md…]()
 # PasarGuard Manager (`pg-m`)
 
 **x-ui style management menu for [PasarGuard](https://github.com/PasarGuard) Panel & Node**
 
-Version **1.4.0** — English-only terminal UI, built on official `pasarguard` / `pg-node` commands.
+Version **1.4.1** — English-only terminal UI, built on official `pasarguard` / `pg-node` commands.
 
 ---
 
@@ -69,6 +69,9 @@ Panel URL is shown at the top of the main menu when the panel is installed.
 ---
 
 ## SSL notes
+
+- Certificates are **copied** to `/var/lib/pasarguard/certs/<domain>/` because the panel container cannot read `/etc/letsencrypt`.
+- Issue / Renew / Apply all use this path and set `UVICORN_PORT=443`.
 
 - **Issue** frees port 80 (stops panel / nginx / apache / caddy, `fuser -k 80/tcp`) before `certbot --standalone`.
 - **List** shows `Active` / `Expires <30d` / `EXPIRED`.
