@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.5.0
+#  PasarGuard Manager (pg-m)  v1.6.0
 #  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -12,7 +12,7 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 
 hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter..."; }
@@ -464,21 +464,227 @@ m_backup(){
 
 # ─────────────────── 5 Migrate ───────────────────
 m_migrate(){
-  header
-  echo -e "  ${BOLD}5. Migrate${NC}"; hr
-  read -rp "  Create package? (yes/no): " c
-  [[ "$c" != yes ]] && return
-  DIR=~/pg-migrate-$(date +%F-%H%M); mkdir -p "$DIR"
-  pasarguard backup 2>/dev/null || true
-  cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
-  cp -a "$ENV_FILE" "$DIR/env.backup" 2>/dev/null || true
-  cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
-  cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
-  ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
-  tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
-  echo -e "  ${GREEN}$ARC${NC}"
-  echo "  New server: install -> restore -> fix env -> restart"
-  pause
+  while true; do
+    header
+    echo -e "  ${BOLD}5. Migrate to New Server${NC}"; hr
+    echo "  1. Create migration package only"
+    echo "  2. Full Auto Transfer (package + upload + remote install + restore)"
+    echo "  3. Help / How it works"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        header
+        echo -e "  ${BOLD}Creating migration package...${NC}"; hr
+        DIR=~/pg-migrate-$(date +%F-%H%M)
+        mkdir -p "$DIR"
+        echo -e "  ${CYAN}→ Running official backup...${NC}"
+        pasarguard backup 2>/dev/null || true
+        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
+        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
+        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
+        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
+        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
+        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
+        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
+        rm -rf "$DIR"
+        echo -e "  ${GREEN}Package created:${NC}"
+        echo -e "  ${CYAN}$ARC${NC}"
+        ls -lh "$ARC" 2>/dev/null || true
+        echo
+        echo "  Next steps on new server:"
+        echo "  1. Upload this file"
+        echo "  2. Install panel + pg-m"
+        echo "  3. Extract and restore"
+        pause
+        ;;
+      2)
+        header
+        echo -e "  ${BOLD}Full Auto Transfer to New VPS${NC}"; hr
+        echo -e "  ${YELLOW}This will:${NC}"
+        echo "  • Create full migration package"
+        echo "  • Upload it to the new server via SSH/SCP"
+        echo "  • Install pg-m on the new server"
+        echo "  • Install PasarGuard panel (if missing)"
+        echo "  • Restore backup + apply certs + restart"
+        echo
+        read -rp "  New server IP: " NEW_IP
+        [[ -z "$NEW_IP" ]] && { echo -e "  ${RED}IP required${NC}"; pause; continue; }
+        read -rp "  SSH Port [22]: " NEW_PORT
+        NEW_PORT=${NEW_PORT:-22}
+        read -rp "  SSH User [root]: " NEW_USER
+        NEW_USER=${NEW_USER:-root}
+        echo
+        echo -e "  ${CYAN}Authentication method:${NC}"
+        echo "  1. Password"
+        echo "  2. SSH Key (path to private key)"
+        read -rp "  Select [1]: " AUTH_METHOD
+        AUTH_METHOD=${AUTH_METHOD:-1}
+
+        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $NEW_PORT"
+        SCP_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -P $NEW_PORT"
+
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          read -rp "  Path to private key: " KEY_PATH
+          [[ ! -f "$KEY_PATH" ]] && { echo -e "  ${RED}Key not found${NC}"; pause; continue; }
+          SSH_OPTS="$SSH_OPTS -i $KEY_PATH"
+          SCP_OPTS="$SCP_OPTS -i $KEY_PATH"
+        else
+          if ! command -v sshpass &>/dev/null; then
+            echo -e "  ${YELLOW}Installing sshpass...${NC}"
+            apt-get update -qq && apt-get install -y -qq sshpass >/dev/null 2>&1 || {
+              echo -e "  ${RED}Could not install sshpass. Use SSH key method instead.${NC}"
+              pause; continue
+            }
+          fi
+          read -rsp "  Root password: " NEW_PASS
+          echo
+          export SSHPASS="$NEW_PASS"
+        fi
+
+        echo -e "  ${CYAN}→ Testing SSH connection...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          if ! ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
+            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
+          fi
+        else
+          if ! sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
+            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
+          fi
+        fi
+        echo -e "  ${GREEN}Connected successfully${NC}"
+
+        echo -e "  ${CYAN}→ Creating migration package...${NC}"
+        DIR=~/pg-migrate-$(date +%F-%H%M)
+        mkdir -p "$DIR"
+        pasarguard backup 2>/dev/null || true
+        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
+        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
+        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
+        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
+        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
+        DB_TYPE=$(get_env DATABASE_TYPE 2>/dev/null || echo "timescaledb")
+        echo "$DB_TYPE" > "$DIR/db_type.txt"
+        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
+        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
+        rm -rf "$DIR"
+        echo -e "  ${GREEN}Package ready: $(basename "$ARC")${NC}"
+
+        echo -e "  ${CYAN}→ Uploading package to new server...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
+            echo -e "  ${RED}Upload failed${NC}"; pause; continue
+          }
+        else
+          sshpass -e scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
+            echo -e "  ${RED}Upload failed${NC}"; pause; continue
+          }
+        fi
+        echo -e "  ${GREEN}Upload complete${NC}"
+
+        REMOTE_SCRIPT='#!/bin/bash
+set -e
+ARC=$(ls -1t /root/pg-migrate-*.tar.gz 2>/dev/null | head -1)
+if [[ -z "$ARC" ]]; then
+  echo "ERROR: No migration package found in /root"
+  exit 1
+fi
+echo "→ Found package: $ARC"
+cd /root
+tar -xzf "$ARC"
+MIG_DIR=$(ls -d pg-migrate-* | head -1)
+echo "→ Extracted to $MIG_DIR"
+
+if [[ -f "$MIG_DIR/pg-m" ]]; then
+  cp "$MIG_DIR/pg-m" /usr/local/bin/pg-m
+  chmod +x /usr/local/bin/pg-m
+  echo "→ pg-m installed"
+fi
+
+if ! command -v pasarguard &>/dev/null; then
+  echo "→ Installing PasarGuard panel..."
+  DB_TYPE=$(cat "$MIG_DIR/db_type.txt" 2>/dev/null || echo "timescaledb")
+  case "$DB_TYPE" in
+    mysql|mariadb|postgresql|sqlite) ;;
+    *) DB_TYPE="timescaledb" ;;
+  esac
+  bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database "$DB_TYPE" --no-ssl || true
+fi
+
+if command -v pasarguard &>/dev/null; then
+  mkdir -p /opt/pasarguard/backup
+  cp -a "$MIG_DIR"/* /opt/pasarguard/backup/ 2>/dev/null || true
+  pasarguard restore || echo "→ Manual restore may be needed via: pasarguard restore"
+fi
+
+if [[ -f "$MIG_DIR/env.backup" ]]; then
+  mkdir -p /opt/pasarguard
+  cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
+  echo "→ .env restored"
+fi
+
+if [[ -d "$MIG_DIR/certs" ]]; then
+  mkdir -p /var/lib/pasarguard
+  cp -a "$MIG_DIR/certs" /var/lib/pasarguard/
+  echo "→ Panel certs restored"
+fi
+if [[ -d "$MIG_DIR/letsencrypt" ]]; then
+  cp -a "$MIG_DIR/letsencrypt" /etc/
+  echo "→ Let'\''s Encrypt certs restored"
+fi
+
+if command -v pasarguard &>/dev/null; then
+  pasarguard restart || true
+  echo "→ Panel restarted"
+fi
+
+echo ""
+echo "════════════════════════════════════════"
+echo "  Migration finished on this server"
+echo "  Run:  pg-m"
+echo "════════════════════════════════════════"
+'
+
+        echo -e "  ${CYAN}→ Running remote installation & restore...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
+        else
+          sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
+        fi
+
+        echo
+        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
+        echo -e "  ${GREEN}  Full transfer completed!${NC}"
+        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
+        echo
+        echo -e "  New server: ${CYAN}${NEW_IP}${NC}"
+        echo -e "  Login and run:  ${CYAN}pg-m${NC}"
+        echo
+        pause
+        ;;
+      3)
+        header
+        echo -e "  ${BOLD}How Full Auto Transfer works${NC}"; hr
+        echo "  1. Creates a complete package on current server"
+        echo "     (official backup + .env + certs + letsencrypt + pg-m)"
+        echo "  2. Connects to new VPS via SSH (password or key)"
+        echo "  3. Uploads the package"
+        echo "  4. On new server automatically:"
+        echo "     • Installs pg-m"
+        echo "     • Installs PasarGuard panel (same DB type)"
+        echo "     • Restores backup"
+        echo "     • Applies .env and certificates"
+        echo "     • Restarts services"
+        echo
+        echo "  Requirements on new server:"
+        echo "  • Fresh Ubuntu/Debian preferred"
+        echo "  • Root SSH access"
+        echo "  • Ports 22, 80, 443 open"
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
 }
 
 # ─────────────────── 6 Settings ───────────────────
