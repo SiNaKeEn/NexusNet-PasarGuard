@@ -1,11 +1,11 @@
-[README.md](https://github.com/user-attachments/files/33140289/README.md)
+[README.md](https://github.com/user-attachments/files/33150848/README.md)
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal management menu for PasarGuard Panel & Node
 
-**Version 1.7.0**
+**Version 1.8.0**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -35,7 +35,7 @@ pg-m
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v1.7.0                   │
+│                 PasarGuard Manager  v1.8.0                   │
 │          https://panel.example.com/dashboard/                │
 ├──────────────────────────────────────────────────────────────┤
 │  0. Exit                                                     │
