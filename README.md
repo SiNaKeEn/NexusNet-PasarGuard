@@ -1,92 +1,35 @@
-# PasarGuard Manager (`pg-m`)
+[README.md](https://github.com/user-attachments/files/33136636/README.md)
+# PasarGuard Manager (pg-m) v1.3.0
 
-**A powerful, clean and fully English terminal menu for PasarGuard Panel & Node.**
+Clean x-ui style menu for PasarGuard.
 
-Inspired by 3x-ui / Sanaei style menus — built to make managing PasarGuard easy and professional.
-
-**Version 1.1.0**
-
----
-
-## Features
-
-| Category | Options |
-|----------|---------|
-| **Service** | Start / Stop / Restart / Status / Logs |
-| **Install** | TimescaleDB, PostgreSQL, SQLite, MySQL, MariaDB |
-| **Update / Uninstall** | One-click update & clean uninstall |
-| **SSL & Domain** | Let's Encrypt + Self-Signed + view/edit SSL |
-| **Backup & Restore** | Official backup, Telegram auto-backup, restore, manual DB dump |
-| **Migrate** | Full migration package for new server |
-| **Panel Settings** | Temp-key, Change Port, edit .env/compose, DB password reset |
-| **Node Management** | Install node, Show API Key, Show Certificate, edit node .env |
-| **Firewall** | UFW rules + BBR + Fail2Ban |
-| **Tools** | Speedtest, disk, memory, ports, Docker clean, Geo files, system info |
-
----
-
-## Quick Install
+## Install
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/install.sh)
-```
-
-After installation:
-
-```bash
 pg-m
 ```
 
----
-
-## Menu Preview
+## Menu
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║           PasarGuard Manager  v1.1.0                     ║
-╚══════════════════════════════════════════════════════════╝
-
-  1)  Service Management
-  2)  Install / Update / Uninstall
-  3)  SSL & Domain Management
-  4)  Backup & Restore
-  5)  Migrate to New Server
-  6)  Panel Settings
-  7)  Node Management
-  8)  Firewall & Security
-  9)  Tools
-  10) Quick Status
-  0)  Exit
+0. Service Management
+1. Install / Update / Uninstall
+2. Panel Port & Links
+3. SSL Certificate Management
+4. Backup & Restore
+5. Migrate to New Server
+6. Panel Settings
+7. Node Management
+8. Firewall & Security
+9. Tools
+10. Quick Status
+11. Exit
 ```
 
----
+## SSL features
 
-## Requirements
-
-- Ubuntu / Debian (recommended)
-- Root access
-- PasarGuard already installed **or** install it from the menu
-
----
-
-## Notes
-
-- All text inside the terminal is **English only**.
-- Frontend for official `pasarguard` and `pg-node` commands.
-- Compatible with future official updates.
-
----
-
-## Uninstall
-
-```bash
-rm -f /usr/local/bin/pg-m
-```
-
----
-
-## License
-
-MIT
-
-**Made for the PasarGuard community**
+- List certs with Active / Expires soon / EXPIRED
+- New Let's Encrypt (warns if already exists)
+- Renew (certbot renew)
+- Apply cert to panel .env
