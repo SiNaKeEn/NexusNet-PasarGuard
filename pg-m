@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.8.0
+#  PasarGuard Manager (pg-m)  v1.9.0
 #  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -12,7 +12,7 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.9.0"
 
 hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter..."; }
@@ -681,23 +681,43 @@ if [[ -d "$MIG_DIR/letsencrypt" ]]; then
   echo "→ LE certs copied to panel path"
 fi
 
-# Restore .env but force safe SSL settings until certs verified
+# Restore .env and ALWAYS rewrite SSL paths based on actual cert files
 if [[ -f "$MIG_DIR/env.backup" ]]; then
   mkdir -p /opt/pasarguard
   cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
-  # If cert files missing, disable SSL so panel can start
-  CERT=$(grep -E "^UVICORN_SSL_CERTFILE=" /opt/pasarguard/.env 2>/dev/null | cut -d= -f2- | sed s/\"//g || true)
-  if [[ -n "$CERT" && ! -f "$CERT" ]]; then
-    echo "→ SSL cert path missing — disabling SSL temporarily so panel starts"
-    sed -i "s|^UVICORN_SSL_CERTFILE=|#UVICORN_SSL_CERTFILE=|" /opt/pasarguard/.env
-    sed -i "s|^UVICORN_SSL_KEYFILE=|#UVICORN_SSL_KEYFILE=|" /opt/pasarguard/.env
-    if grep -q "^UVICORN_PORT=" /opt/pasarguard/.env; then
-      sed -i "s|^UVICORN_PORT=.*|UVICORN_PORT=8000|" /opt/pasarguard/.env
-    else
-      echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
+  echo "→ .env restored from backup"
+fi
+
+# Detect first available panel cert directory with fullchain+privkey
+FOUND_CERT=""
+FOUND_KEY=""
+FOUND_DOMAIN=""
+if [[ -d /var/lib/pasarguard/certs ]]; then
+  for d in /var/lib/pasarguard/certs/*/ ; do
+    [[ -d "$d" ]] || continue
+    if [[ -f "${d}fullchain.pem" && -f "${d}privkey.pem" ]]; then
+      FOUND_CERT="${d}fullchain.pem"
+      FOUND_KEY="${d}privkey.pem"
+      FOUND_DOMAIN=$(basename "$d")
+      break
     fi
-  fi
-  echo "→ .env restored"
+  done
+fi
+
+# Strip any existing SSL/port lines then write correct ones
+if [[ -f /opt/pasarguard/.env ]]; then
+  sed -i "/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^#UVICORN_PORT=/d" /opt/pasarguard/.env
+fi
+
+if [[ -n "$FOUND_CERT" && -f "$FOUND_CERT" && -f "$FOUND_KEY" ]]; then
+  echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> /opt/pasarguard/.env
+  echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> /opt/pasarguard/.env
+  echo "UVICORN_PORT=443" >> /opt/pasarguard/.env
+  echo "→ SSL applied in .env (domain: ${FOUND_DOMAIN}, port 443)"
+else
+  echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
+  echo "→ No valid cert files found — panel starts HTTP on 8000"
+  echo "→ After DNS points here: pg-m → SSL → Issue cert"
 fi
 
 if command -v pasarguard &>/dev/null; then
@@ -993,6 +1013,135 @@ m_firewall(){
 }
 
 # ─────────────────── 10 Tools ───────────────────
+
+m_relay(){
+  while true; do
+    header
+    echo -e "  ${BOLD}12. Subscription Relay / Tunnel${NC}"; hr
+    echo "  Use a healthy foreign VPS as reverse-proxy for sub links"
+    echo "  (user → relay VPS → this panel)"
+    hr
+    echo "  1. Generate nginx config (for relay VPS)"
+    echo "  2. Show helper commands"
+    echo "  3. Apply SSL paths from existing certs (fix .env)"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        echo
+        read -rp "  Relay domain (on healthy VPS) [sub.example.com]: " RELAY_DOM
+        read -rp "  Panel origin URL [https://panel.nexus-net.online]: " ORIGIN
+        RELAY_DOM=${RELAY_DOM:-sub.example.com}
+        ORIGIN=${ORIGIN:-https://panel.nexus-net.online}
+        # strip trailing slash
+        ORIGIN=${ORIGIN%/}
+        OUT="/root/sub-relay-${RELAY_DOM}.conf"
+        cat > "$OUT" << EOF
+# PasarGuard sub relay — install on HEALTHY foreign VPS
+# 1) Point DNS: ${RELAY_DOM} → this VPS IP
+# 2) certbot --nginx -d ${RELAY_DOM}
+# 3) copy this file to /etc/nginx/sites-available/sub-relay
+# 4) ln -sf /etc/nginx/sites-available/sub-relay /etc/nginx/sites-enabled/
+# 5) nginx -t && systemctl reload nginx
+#
+# User sub links become:
+#   https://${RELAY_DOM}/sub/...   instead of ${ORIGIN}/sub/...
+
+server {
+    listen 443 ssl http2;
+    server_name ${RELAY_DOM};
+
+    ssl_certificate     /etc/letsencrypt/live/${RELAY_DOM}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${RELAY_DOM}/privkey.pem;
+
+    location / {
+        proxy_pass ${ORIGIN};
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${ORIGIN#https://};
+        proxy_ssl_name ${ORIGIN#http://};
+        proxy_set_header Host \$proxy_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 15s;
+        proxy_read_timeout 60s;
+    }
+}
+EOF
+        # Fix Host header properly in generated file
+        # Use panel host from ORIGIN
+        PANEL_HOST=$(echo "$ORIGIN" | sed -E 's|https?://||; s|/.*||')
+        sed -i "s|proxy_set_header Host \\\$proxy_host;|proxy_set_header Host ${PANEL_HOST};|" "$OUT"
+        sed -i "/proxy_ssl_name/d" "$OUT"
+        # re-add single proxy_ssl_name
+        sed -i "/proxy_ssl_server_name on;/a\\        proxy_ssl_name ${PANEL_HOST};" "$OUT"
+        echo
+        echo -e "  ${GREEN}Config written:${NC} $OUT"
+        echo
+        cat "$OUT"
+        echo
+        echo -e "  ${CYAN}On relay VPS run:${NC}"
+        echo "    apt install -y nginx certbot python3-certbot-nginx"
+        echo "    certbot --nginx -d ${RELAY_DOM}"
+        echo "    # then place this conf and reload nginx"
+        pause
+        ;;
+      2)
+        echo
+        echo "  Flow:  User → Relay VPS (healthy) → Panel VPS"
+        echo
+        echo "  1. DNS A record of relay domain → Relay VPS IP"
+        echo "  2. Install nginx + certbot on Relay VPS"
+        echo "  3. Use option 1 to generate config"
+        echo "  4. Change client sub links to relay domain"
+        echo
+        echo "  Note: this only fixes SUBSCRIPTION download URL."
+        echo "  VPN traffic still goes to node/panel IPs unless you"
+        echo "  also move nodes or use a traffic relay."
+        pause
+        ;;
+      3)
+        # Local fix: apply SSL from existing certs into .env
+        FOUND_CERT=""
+        FOUND_KEY=""
+        FOUND_DOMAIN=""
+        if [[ -d /var/lib/pasarguard/certs ]]; then
+          for d in /var/lib/pasarguard/certs/*/ ; do
+            [[ -d "$d" ]] || continue
+            if [[ -f "${d}fullchain.pem" && -f "${d}privkey.pem" ]]; then
+              FOUND_CERT="${d}fullchain.pem"
+              FOUND_KEY="${d}privkey.pem"
+              FOUND_DOMAIN=$(basename "$d")
+              break
+            fi
+          done
+        fi
+        if [[ -z "$FOUND_CERT" ]]; then
+          echo -e "  ${RED}No fullchain.pem/privkey.pem under /var/lib/pasarguard/certs${NC}"
+          pause
+          continue
+        fi
+        mkdir -p /opt/pasarguard
+        touch "$ENV_FILE"
+        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^#UVICORN_PORT=/d' "$ENV_FILE"
+        echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> "$ENV_FILE"
+        echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> "$ENV_FILE"
+        echo "UVICORN_PORT=443" >> "$ENV_FILE"
+        echo -e "  ${GREEN}Applied:${NC} $FOUND_DOMAIN → port 443"
+        echo "  Free port 443 if needed, then: pasarguard restart"
+        read -rp "  Restart panel now? [Y/n]: " yn
+        if [[ "${yn:-Y}" =~ ^[Yy]$ ]]; then
+          fuser -k 443/tcp 2>/dev/null || true
+          pasarguard restart 2>/dev/null || true
+          pasarguard status 2>/dev/null || true
+        fi
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
+
 m_tools(){
   while true; do
     header
@@ -1059,9 +1208,10 @@ main(){
     echo -e "  ${BOLD}System${NC}"
     echo "  10) Tools & Utilities"
     echo "  11) Quick Status"
+    echo "  12) Subscription Relay / Tunnel"
     echo "   0) Exit"
     hr
-    read -rp "  Select [0-11]: " c
+    read -rp "  Select [0-12]: " c
     case $c in
       0) echo "  Bye"; exit 0 ;;
       1) m_install ;;
@@ -1074,6 +1224,7 @@ main(){
       8) m_firewall ;;
       9) m_database ;;
       10) m_tools ;;
+      12) m_relay ;;
       11)
         header
         echo -e "  ${BOLD}Quick Status${NC}"; hr
