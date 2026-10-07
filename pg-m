@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.3.0
-#  Clean x-ui style menu for PasarGuard Panel & Node
+#  PasarGuard Manager (pg-m)  v1.4.0
+#  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
-
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -13,643 +12,602 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 
-print_header() {
-    clear
-    echo -e "${GREEN}"
-    echo "  ╔════════════════════════════════════════════╗"
-    echo "  ║      PasarGuard Manager  v${SCRIPT_VERSION}           ║"
-    echo "  ╚════════════════════════════════════════════╝"
-    echo -e "${NC}"
+hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
+pause(){ echo; read -rp "  Press Enter..."; }
+need_root(){ [[ $EUID -eq 0 ]] || { echo -e "${RED}  Run as root${NC}"; exit 1; }; }
+has_pg(){ command -v pasarguard &>/dev/null; }
+
+header(){
+  clear
+  echo -e "${GREEN}"
+  echo "  ╔══════════════════════════════════════════════╗"
+  echo "  ║     PasarGuard Manager  v${SCRIPT_VERSION}              ║"
+  echo "  ╚══════════════════════════════════════════════╝"
+  echo -e "${NC}"
 }
 
-print_line() { echo -e "${CYAN}  ────────────────────────────────────────────${NC}"; }
-
-pause() { echo; read -rp "  Press Enter to continue..."; }
-
-check_root() {
-    [[ $EUID -eq 0 ]] || { echo -e "${RED}  [ERROR] Run as root${NC}"; exit 1; }
+get_env(){
+  local k="$1"
+  [[ -f "$ENV_FILE" ]] && grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ' || true
 }
 
-check_pg() { command -v pasarguard &>/dev/null; }
-
-get_env() {
-    local key="$1"
-    [[ -f "$ENV_FILE" ]] && grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ' || true
+get_ip(){
+  curl -s4 --max-time 3 ifconfig.me 2>/dev/null || curl -s4 --max-time 3 api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-get_ip() {
-    curl -s4 --max-time 3 ifconfig.me 2>/dev/null || curl -s4 --max-time 3 api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'
+get_port(){
+  local p; p=$(get_env UVICORN_PORT); echo "${p:-8000}"
 }
 
-get_port() {
-    local p; p=$(get_env "UVICORN_PORT"); [[ -z "$p" ]] && p="8000"; echo "$p"
+panel_url(){
+  local ip port scheme cert
+  ip=$(get_ip); port=$(get_port); cert=$(get_env UVICORN_SSL_CERTFILE)
+  [[ -n "$cert" ]] && scheme=https || scheme=http
+  if [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; then
+    echo "${scheme}://${ip}/dashboard/"
+  else
+    echo "${scheme}://${ip}:${port}/dashboard/"
+  fi
 }
 
-has_ssl() {
-    local c; c=$(get_env "UVICORN_SSL_CERTFILE"); [[ -n "$c" ]] && echo 1 || echo 0
+show_info(){
+  local cert domain
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  echo -e "  ${BOLD}Panel Info${NC}"; hr
+  echo -e "  Link : ${GREEN}$(panel_url)${NC}"
+  echo -e "  IP   : $(get_ip)"
+  echo -e "  Port : $(get_port)"
+  if [[ -n "$cert" ]]; then
+    echo -e "  SSL  : ${GREEN}ON${NC}  ($cert)"
+    if echo "$cert" | grep -q 'letsencrypt/live/'; then
+      domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
+      [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}https://${domain}/dashboard/${NC}"
+    fi
+  else
+    echo -e "  SSL  : ${YELLOW}OFF${NC}"
+  fi
+  hr
 }
 
-panel_url() {
-    local ip port scheme
-    ip=$(get_ip); port=$(get_port)
-    [[ $(has_ssl) -eq 1 ]] && scheme="https" || scheme="http"
-    if { [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; }; then
-        echo "${scheme}://${ip}/dashboard/"
+free_port_80(){
+  echo -e "  ${YELLOW}Freeing port 80...${NC}"
+  has_pg && pasarguard down 2>/dev/null || true
+  # stop common web servers
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  fuser -k 80/tcp 2>/dev/null || true
+  sleep 1
+  if ss -tlnp | grep -q ':80 '; then
+    echo -e "  ${RED}Port 80 still busy:${NC}"
+    ss -tlnp | grep ':80 '
+    return 1
+  fi
+  echo -e "  ${GREEN}Port 80 is free${NC}"
+  return 0
+}
+
+list_certs(){
+  echo -e "  ${BOLD}Certificates${NC}"; hr
+  if [[ ! -d /etc/letsencrypt/live ]]; then
+    echo "  (none)"; return
+  fi
+  local d name exp status
+  for d in /etc/letsencrypt/live/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    [[ "$name" == "README" ]] && continue
+    [[ -f "${d}fullchain.pem" ]] || continue
+    exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
+    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then
+      status="${RED}EXPIRED${NC}"
+    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" 2>/dev/null; then
+      status="${YELLOW}Expires <30d${NC}"
     else
-        echo "${scheme}://${ip}:${port}/dashboard/"
+      status="${GREEN}Active${NC}"
     fi
+    echo -e "  • ${CYAN}${name}${NC}  [${status}]"
+    echo -e "    Expiry : ${exp}"
+    echo -e "    Path   : ${d}fullchain.pem"
+  done
+  hr
 }
 
-show_links() {
-    local ip port cert domain
-    ip=$(get_ip); port=$(get_port); cert=$(get_env "UVICORN_SSL_CERTFILE")
-    echo -e "  ${BOLD}Panel Link${NC}"
-    print_line
-    echo -e "  URL   : ${GREEN}$(panel_url)${NC}"
-    echo -e "  IP    : ${CYAN}${ip}${NC}"
-    echo -e "  Port  : ${CYAN}${port}${NC}"
-    if [[ -n "$cert" ]]; then
-        echo -e "  SSL   : ${GREEN}Enabled${NC}"
-        echo -e "  Cert  : ${CYAN}${cert}${NC}"
-        if echo "$cert" | grep -q "letsencrypt/live/"; then
-            domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
-            [[ -n "$domain" ]] && echo -e "  Domain: ${GREEN}https://${domain}/dashboard/${NC}"
+# ─────────────────── 0 Service ───────────────────
+m_service(){
+  while true; do
+    header
+    echo -e "  ${BOLD}0. Service${NC}"; hr
+    echo "  1. Start          2. Stop"
+    echo "  3. Restart        4. Status"
+    echo "  5. Logs (live)    6. Logs (once)"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pasarguard up; pause ;;
+      2) pasarguard down; pause ;;
+      3) pasarguard restart; pause ;;
+      4) pasarguard status; pause ;;
+      5) pasarguard logs ;;
+      6) pasarguard logs -n; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 1 Install ───────────────────
+m_install(){
+  while true; do
+    header
+    echo -e "  ${BOLD}1. Install / Update / Uninstall${NC}"; hr
+    echo "  1. Install TimescaleDB (recommended)"
+    echo "  2. Install PostgreSQL"
+    echo "  3. Install SQLite"
+    echo "  4. Install MySQL"
+    echo "  5. Install MariaDB"
+    echo "  6. Update panel"
+    echo "  7. Uninstall panel"
+    echo "  8. Reinstall CLI script"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database timescaledb; pause ;;
+      2) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database postgresql; pause ;;
+      3) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install; pause ;;
+      4) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mysql; pause ;;
+      5) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mariadb; pause ;;
+      6) pasarguard update; pause ;;
+      7) read -rp "  Type yes to uninstall: " c; [[ "$c" == yes ]] && pasarguard uninstall; pause ;;
+      8) pasarguard install-script; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 2 Port ───────────────────
+m_port(){
+  while true; do
+    header
+    echo -e "  ${BOLD}2. Port & Access${NC}"; hr
+    show_info
+    echo "  1. Change panel port"
+    echo "  2. Open firewall for panel port"
+    echo "  3. Sub link port help"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        echo "  Current: $(get_port) | Suggest: 8443 2083 2053 2087"
+        read -rp "  New port: " np
+        if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 && -f "$ENV_FILE" ]]; then
+          grep -q '^UVICORN_PORT=' "$ENV_FILE" && sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE" || echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
+          ufw allow "${np}/tcp" 2>/dev/null || true
+          pasarguard restart
+          show_info
         fi
-    else
-        echo -e "  SSL   : ${YELLOW}Disabled${NC}"
+        pause
+        ;;
+      2)
+        p=$(get_port)
+        ufw allow 80/tcp 2>/dev/null || true
+        ufw allow 443/tcp 2>/dev/null || true
+        ufw allow "${p}/tcp" 2>/dev/null || true
+        echo -e "  ${GREEN}Opened 80, 443, ${p}${NC}"
+        pause
+        ;;
+      3)
+        echo "  Sub URL port = panel port / domain in Settings > Subscriptions"
+        echo "  Hosts page = inbound address/port inside configs (not sub URL)"
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 3 SSL ───────────────────
+m_ssl(){
+  while true; do
+    header
+    echo -e "  ${BOLD}3. SSL Certificate${NC}"; hr
+    echo "  1. List certificates (status)"
+    echo "  2. Issue new certificate"
+    echo "  3. Renew all (certbot renew)"
+    echo "  4. Apply cert to panel"
+    echo "  5. Delete / revoke certificate"
+    echo "  6. Self-signed certificate"
+    echo "  7. Show .env SSL lines"
+    echo "  8. Edit .env"
+    echo "  9. Restart panel"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) list_certs; pause ;;
+      2)
+        list_certs
+        read -rp "  Domain: " domain
+        [[ -z "$domain" ]] && continue
+        if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+          echo -e "  ${YELLOW}Already exists for ${domain}${NC}"
+          read -rp "  Force re-issue? (yes/no): " force
+          [[ "$force" != yes ]] && { echo "  Use Renew instead."; pause; continue; }
+        fi
+        apt install -y certbot >/dev/null 2>&1 || true
+        ufw allow 80/tcp 2>/dev/null || true
+        free_port_80 || { echo -e "  ${RED}Cannot free port 80${NC}"; pause; continue; }
+        if [[ "${force:-}" == yes ]]; then
+          certbot certonly --standalone -d "$domain" --force-renewal --non-interactive --agree-tos --register-unsafely-without-email || \
+          certbot certonly --standalone -d "$domain" --force-renewal
+        else
+          certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email || \
+          certbot certonly --standalone -d "$domain"
+        fi
+        has_pg && pasarguard up 2>/dev/null || true
+        if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+          echo -e "  ${GREEN}Success. Use option 4 to apply.${NC}"
+        else
+          echo -e "  ${RED}Failed. Check DNS A record → this server IP.${NC}"
+        fi
+        pause
+        ;;
+      3)
+        certbot renew
+        list_certs
+        pause
+        ;;
+      4)
+        list_certs
+        read -rp "  Domain to apply: " domain
+        [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]] && { echo "  Not found"; pause; continue; }
+        [[ -f "$ENV_FILE" ]] || { echo "  No .env"; pause; continue; }
+        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d' "$ENV_FILE"
+        {
+          echo "UVICORN_SSL_CERTFILE=/etc/letsencrypt/live/${domain}/fullchain.pem"
+          echo "UVICORN_SSL_KEYFILE=/etc/letsencrypt/live/${domain}/privkey.pem"
+          echo "UVICORN_PORT=443"
+        } >> "$ENV_FILE"
+        ufw allow 443/tcp 2>/dev/null || true
+        pasarguard restart
+        show_info
+        pause
+        ;;
+      5)
+        list_certs
+        read -rp "  Domain to delete: " domain
+        [[ -z "$domain" ]] && continue
+        if [[ ! -d "/etc/letsencrypt/live/${domain}" ]]; then
+          echo "  Not found"; pause; continue
+        fi
+        echo -e "  ${RED}This removes the certificate for ${domain}${NC}"
+        read -rp "  Type yes: " c
+        if [[ "$c" == yes ]]; then
+          certbot revoke --cert-path "/etc/letsencrypt/live/${domain}/fullchain.pem" --non-interactive 2>/dev/null || true
+          certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || \
+          rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
+          echo -e "  ${GREEN}Deleted ${domain}${NC}"
+          # clean .env if pointing to this cert
+          if grep -q "/live/${domain}/" "$ENV_FILE" 2>/dev/null; then
+            echo -e "  ${YELLOW}.env still points to this domain. Edit SSL settings.${NC}"
+          fi
+        fi
+        pause
+        ;;
+      6)
+        read -rp "  CN (IP/domain): " cn
+        mkdir -p /var/lib/pasarguard/certs
+        openssl req -x509 -newkey rsa:4096 -keyout /var/lib/pasarguard/certs/key.pem \
+          -out /var/lib/pasarguard/certs/cert.pem -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
+        echo "  /var/lib/pasarguard/certs/cert.pem"
+        echo "  /var/lib/pasarguard/certs/key.pem"
+        pause
+        ;;
+      7) grep -E 'SSL|UVICORN|CERT|KEY|PORT' "$ENV_FILE" 2>/dev/null || echo "  none"; pause ;;
+      8) pasarguard edit-env ;;
+      9) pasarguard restart; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 4 Backup ───────────────────
+m_backup(){
+  while true; do
+    header
+    echo -e "  ${BOLD}4. Backup & Restore${NC}"; hr
+    echo "  1. Manual backup"
+    echo "  2. Telegram auto-backup"
+    echo "  3. Restore"
+    echo "  4. List files"
+    echo "  5. Paths"
+    echo "  6. PostgreSQL dump"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pasarguard backup; pause ;;
+      2) pasarguard backup-service; pause ;;
+      3) pasarguard restore; pause ;;
+      4) ls -lh "$BACKUP_DIR" 2>/dev/null || echo "  empty"; pause ;;
+      5) echo "  $BACKUP_DIR"; echo "  $APP_DIR"; echo "  $DATA_DIR"; pause ;;
+      6)
+        OUT=~/pg-$(date +%F-%H%M).dump
+        C=$(docker ps -qf name=postgresql | head -1)
+        if [[ -n "$C" ]]; then
+          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
+          docker cp "$C":/tmp/pg.dump "$OUT"
+          echo -e "  ${GREEN}$OUT${NC}"
+        else echo "  no container"; fi
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 5 Migrate ───────────────────
+m_migrate(){
+  header
+  echo -e "  ${BOLD}5. Migrate${NC}"; hr
+  read -rp "  Create package? (yes/no): " c
+  [[ "$c" != yes ]] && return
+  DIR=~/pg-migrate-$(date +%F-%H%M); mkdir -p "$DIR"
+  pasarguard backup 2>/dev/null || true
+  cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
+  cp -a "$ENV_FILE" "$DIR/env.backup" 2>/dev/null || true
+  cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
+  cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
+  ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
+  tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
+  echo -e "  ${GREEN}$ARC${NC}"
+  echo "  New server: install -> restore -> fix env -> restart"
+  pause
+}
+
+# ─────────────────── 6 Settings ───────────────────
+m_settings(){
+  while true; do
+    header
+    echo -e "  ${BOLD}6. Panel Settings${NC}"; hr
+    echo "  1. Temp key (owner)"
+    echo "  2. Show panel link"
+    echo "  3. View .env"
+    echo "  4. Edit .env"
+    echo "  5. Edit compose"
+    echo "  6. DB URL"
+    echo "  7. Versions"
+    echo "  8. Reset PG password"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pasarguard cli generate-temp-key; pause ;;
+      2) show_info; pause ;;
+      3) cat "$ENV_FILE" 2>/dev/null || echo missing; pause ;;
+      4) pasarguard edit-env ;;
+      5) pasarguard edit ;;
+      6) grep -i SQLALCHEMY_DATABASE_URL "$ENV_FILE" 2>/dev/null || true; pause ;;
+      7) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -i pasarguard || true; pause ;;
+      8)
+        read -rp "  New password: " npw
+        C=$(docker ps -qf name=postgresql | head -1)
+        [[ -n "$C" && -n "$npw" ]] && docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" && echo OK
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 7 Node ───────────────────
+m_node(){
+  while true; do
+    header
+    echo -e "  ${BOLD}7. Node${NC}"; hr
+    echo "  1. Install node"
+    echo "  2. Install custom name"
+    echo "  3. Show API Key"
+    echo "  4. Show Certificate"
+    echo "  5. Show .env"
+    echo "  6. Edit .env"
+    echo "  7. Help / status"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install; pause ;;
+      2) read -rp "  Name: " n; [[ -n "$n" ]] && bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install --name "$n"; pause ;;
+      3)
+        for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do
+          [[ -f "$f" ]] && { echo -e "  ${GREEN}$f${NC}"; grep -i API_KEY "$f" || true; }
+        done; pause
+        ;;
+      4)
+        for f in /var/lib/pg-node/certs/ssl_cert.pem /opt/pg-node/certs/ssl_cert.pem; do
+          [[ -f "$f" ]] && { echo "$f"; cat "$f"; }
+        done
+        find /var/lib /opt -name ssl_cert.pem 2>/dev/null | head -5
+        pause
+        ;;
+      5) for f in /opt/pg-node/.env /var/lib/pg-node/.env; do [[ -f "$f" ]] && cat "$f"; done; pause ;;
+      6)
+        if [[ -f /opt/pg-node/.env ]]; then nano /opt/pg-node/.env
+        elif [[ -f /var/lib/pg-node/.env ]]; then nano /var/lib/pg-node/.env
+        else read -rp "  Path: " p; [[ -f "$p" ]] && nano "$p"; fi
+        ;;
+      7) command -v pg-node >/dev/null && { pg-node --help; pg-node status; } || echo "  not installed"; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 8 Firewall + IP Limit ───────────────────
+m_firewall(){
+  while true; do
+    header
+    echo -e "  ${BOLD}8. Firewall & IP Limit${NC}"; hr
+    echo "  1. Install + enable UFW"
+    echo "  2. Allow SSH 22"
+    echo "  3. Allow panel port"
+    echo "  4. Allow 80 / 443"
+    echo "  5. Allow custom port"
+    echo "  6. UFW status"
+    echo "  7. Enable BBR"
+    echo "  8. Install Fail2Ban"
+    echo "  9. IP Limit - allow only my IP to panel"
+    echo "  10. IP Limit - add allowed IP"
+    echo "  11. IP Limit - list / reset panel rules"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        apt install -y ufw >/dev/null 2>&1
+        ufw default deny incoming; ufw default allow outgoing
+        ufw allow 22/tcp; ufw --force enable
+        echo -e "  ${GREEN}UFW enabled${NC}"; pause
+        ;;
+      2) ufw allow 22/tcp; echo OK; pause ;;
+      3) p=$(get_port); ufw allow "${p}/tcp"; echo "  $p OK"; pause ;;
+      4) ufw allow 80/tcp; ufw allow 443/tcp; echo OK; pause ;;
+      5) read -rp "  Port: " p; [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "${p}/tcp"; pause ;;
+      6) ufw status verbose; pause ;;
+      7)
+        grep -q bbr /etc/sysctl.conf 2>/dev/null || {
+          echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        }
+        sysctl -p >/dev/null; sysctl net.ipv4.tcp_congestion_control; pause
+        ;;
+      8)
+        apt install -y fail2ban >/dev/null 2>&1
+        systemctl enable --now fail2ban
+        echo -e "  ${GREEN}Fail2Ban on${NC}"; pause
+        ;;
+      9)
+        # Restrict panel port to current SSH client IP
+        p=$(get_port)
+        myip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+        [[ -z "$myip" ]] && myip=$(get_ip)
+        echo -e "  Panel port: ${CYAN}${p}${NC}"
+        echo -e "  Your IP   : ${CYAN}${myip}${NC}"
+        read -rp "  Lock panel port to this IP only? (yes/no): " c
+        if [[ "$c" == yes ]]; then
+          # delete open allow for port then allow from IP
+          ufw delete allow "${p}/tcp" 2>/dev/null || true
+          ufw allow from "$myip" to any port "$p" proto tcp
+          ufw reload
+          echo -e "  ${GREEN}Panel port ${p} only from ${myip}${NC}"
+          echo -e "  ${YELLOW}Warning: other IPs cannot open panel${NC}"
+        fi
+        pause
+        ;;
+      10)
+        p=$(get_port)
+        read -rp "  IP to allow for panel port ${p}: " ip
+        if [[ -n "$ip" ]]; then
+          ufw allow from "$ip" to any port "$p" proto tcp
+          ufw reload
+          echo -e "  ${GREEN}Allowed ${ip} -> ${p}${NC}"
+        fi
+        pause
+        ;;
+      11)
+        p=$(get_port)
+        echo -e "  Rules related to port ${p}:"
+        ufw status numbered | grep -E "${p}|Status" || ufw status
+        echo
+        read -rp "  Reset: open panel port ${p} to world? (yes/no): " c
+        if [[ "$c" == yes ]]; then
+          # remove from-ip rules is hard; open general allow
+          ufw allow "${p}/tcp"
+          ufw reload
+          echo -e "  ${GREEN}Port ${p} open to all${NC}"
+        fi
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 9 Tools ───────────────────
+m_tools(){
+  while true; do
+    header
+    echo -e "  ${BOLD}9. Tools${NC}"; hr
+    echo "  1. Speedtest          2. Disk"
+    echo "  3. Memory             4. Ports"
+    echo "  5. Restart Docker     6. Docker prune"
+    echo "  7. Update Geo files   8. System info"
+    echo "  9. Panel link         10. Who uses port 80"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) command -v speedtest-cli >/dev/null || apt install -y speedtest-cli 2>/dev/null || true
+         speedtest-cli --simple 2>/dev/null || echo n/a; pause ;;
+      2) df -h; pause ;;
+      3) free -h; pause ;;
+      4) ss -tlnp; pause ;;
+      5) systemctl restart docker; echo OK; pause ;;
+      6) docker system prune -f; echo OK; pause ;;
+      7)
+        mkdir -p /usr/local/share/xray
+        curl -fsSL -o /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>/dev/null
+        curl -fsSL -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat 2>/dev/null
+        echo OK; pause
+        ;;
+      8)
+        echo "  Host $(hostname) | $(nproc) CPU"
+        grep PRETTY /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'
+        free -h | grep Mem; df -h / | tail -1; pause
+        ;;
+      9) show_info; pause ;;
+      10) ss -tlnp | grep ':80 ' || echo "  port 80 free"; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── Main ───────────────────
+main(){
+  while true; do
+    header
+    if has_pg && [[ -f "$ENV_FILE" ]]; then
+      echo -e "  ${GREEN}$(panel_url)${NC}"; hr
     fi
-    print_line
+    echo "  0. Service Management"
+    echo "  1. Install / Update / Uninstall"
+    echo "  2. Port & Access Links"
+    echo "  3. SSL Certificate"
+    echo "  4. Backup & Restore"
+    echo "  5. Migrate to New Server"
+    echo "  6. Panel Settings"
+    echo "  7. Node Management"
+    echo "  8. Firewall & IP Limit"
+    echo "  9. Tools"
+    echo "  10. Quick Status"
+    echo "  11. Exit"; hr
+    read -rp "  Select [0-11]: " c
+    case $c in
+      0) m_service ;;
+      1) m_install ;;
+      2) m_port ;;
+      3) m_ssl ;;
+      4) m_backup ;;
+      5) m_migrate ;;
+      6) m_settings ;;
+      7) m_node ;;
+      8) m_firewall ;;
+      9) m_tools ;;
+      10)
+        header
+        has_pg && pasarguard status || echo "  not installed"
+        echo; show_info
+        df -h / | tail -1; free -h | grep Mem
+        pause
+        ;;
+      11) echo "  Bye"; exit 0 ;;
+    esac
+  done
 }
 
-# ── SSL helpers ──────────────────────────────────────────────
-list_certs() {
-    echo -e "  ${BOLD}Installed certificates${NC}"
-    print_line
-    if [[ ! -d /etc/letsencrypt/live ]]; then
-        echo -e "  ${YELLOW}No Let's Encrypt certificates found${NC}"
-        return
-    fi
-    local d exp status
-    for d in /etc/letsencrypt/live/*/; do
-        [[ -d "$d" ]] || continue
-        local name; name=$(basename "$d")
-        [[ "$name" == "README" ]] && continue
-        if [[ -f "${d}fullchain.pem" ]]; then
-            exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
-            if openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then
-                if openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" 2>/dev/null; then
-                    status="${GREEN}Active${NC}"
-                else
-                    status="${YELLOW}Expires soon (<30 days)${NC}"
-                fi
-            else
-                status="${RED}EXPIRED${NC}"
-            fi
-            echo -e "  Domain : ${CYAN}${name}${NC}"
-            echo -e "  Status : ${status}"
-            echo -e "  Expiry : ${exp}"
-            echo -e "  Path   : ${d}fullchain.pem"
-            print_line
-        fi
-    done
-}
-
-# ═══════════════════════════════════════════════════════════
-#  MENUS
-# ═══════════════════════════════════════════════════════════
-
-menu_service() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}0. Service Management${NC}"
-        print_line
-        echo "  1. Start"
-        echo "  2. Stop"
-        echo "  3. Restart"
-        echo "  4. Status"
-        echo "  5. Logs (live)"
-        echo "  6. Logs (snapshot)"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-6]: " o
-        case $o in
-            1) pasarguard up; pause ;;
-            2) pasarguard down; pause ;;
-            3) pasarguard restart; pause ;;
-            4) pasarguard status; pause ;;
-            5) pasarguard logs ;;
-            6) pasarguard logs -n; pause ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_install() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}1. Install / Update / Uninstall${NC}"
-        print_line
-        echo "  1. Install (TimescaleDB)"
-        echo "  2. Install (PostgreSQL)"
-        echo "  3. Install (SQLite)"
-        echo "  4. Install (MySQL)"
-        echo "  5. Install (MariaDB)"
-        echo "  6. Update panel"
-        echo "  7. Uninstall panel"
-        echo "  8. Reinstall script"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-8]: " o
-        case $o in
-            1) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database timescaledb; pause ;;
-            2) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database postgresql; pause ;;
-            3) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install; pause ;;
-            4) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mysql; pause ;;
-            5) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mariadb; pause ;;
-            6) pasarguard update; pause ;;
-            7)
-                echo -e "  ${RED}This deletes the panel and data!${NC}"
-                read -rp "  Type yes to confirm: " c
-                [[ "$c" == "yes" ]] && pasarguard uninstall
-                pause
-                ;;
-            8) pasarguard install-script; pause ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_port() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}2. Panel Port & Links${NC}"
-        print_line
-        show_links
-        echo "  1. Change panel port"
-        echo "  2. Open firewall for panel port"
-        echo "  3. Subscription port help"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-3]: " o
-        case $o in
-            1)
-                echo -e "  Current port: ${CYAN}$(get_port)${NC}"
-                echo "  Suggested if blocked: 8443  2083  2053  2087"
-                read -rp "  New port: " np
-                if [[ "$np" =~ ^[0-9]+$ && "$np" -ge 1 && "$np" -le 65535 ]]; then
-                    [[ -f "$ENV_FILE" ]] || { echo "  .env not found"; pause; continue; }
-                    if grep -q "^UVICORN_PORT=" "$ENV_FILE"; then
-                        sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE"
-                    else
-                        echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
-                    fi
-                    ufw allow "${np}/tcp" 2>/dev/null || true
-                    echo -e "  ${GREEN}Port set to ${np}. Restarting...${NC}"
-                    pasarguard restart
-                    show_links
-                else
-                    echo -e "  ${RED}Invalid port${NC}"
-                fi
-                pause
-                ;;
-            2)
-                p=$(get_port)
-                ufw allow 80/tcp 2>/dev/null || true
-                ufw allow 443/tcp 2>/dev/null || true
-                ufw allow "${p}/tcp" 2>/dev/null || true
-                echo -e "  ${GREEN}Opened 80, 443, ${p}${NC}"
-                pause
-                ;;
-            3)
-                echo "  Subscription link port = panel port (or domain via Settings > Subscriptions)."
-                echo "  Config/inbound ports are set in Panel > Hosts (edit each host)."
-                echo "  If only VPN works, try panel port 8443 / 2083."
-                pause
-                ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_ssl() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}3. SSL Certificate Management${NC}"
-        print_line
-        echo "  1. List certificates (status / expiry)"
-        echo "  2. Get new Let's Encrypt certificate"
-        echo "  3. Renew certificates (certbot renew)"
-        echo "  4. Apply certificate to panel (.env)"
-        echo "  5. Generate self-signed certificate"
-        echo "  6. Show SSL lines in .env"
-        echo "  7. Edit .env"
-        echo "  8. Restart panel"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-8]: " o
-        case $o in
-            1) list_certs; pause ;;
-            2)
-                list_certs
-                read -rp "  Domain (example: panel.example.com): " domain
-                [[ -z "$domain" ]] && continue
-                if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-                    echo -e "  ${YELLOW}Certificate already exists for ${domain}${NC}"
-                    openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${domain}/fullchain.pem" 2>/dev/null || true
-                    read -rp "  Force new certificate anyway? (yes/no): " force
-                    [[ "$force" != "yes" ]] && { echo "  Cancelled. Use option 3 to renew."; pause; continue; }
-                fi
-                apt update -y >/dev/null 2>&1
-                apt install -y certbot >/dev/null 2>&1
-                ufw allow 80/tcp 2>/dev/null || true
-                echo -e "  ${YELLOW}Stopping panel for port 80 verification...${NC}"
-                pasarguard down 2>/dev/null || true
-                if [[ "${force:-}" == "yes" ]]; then
-                    certbot certonly --standalone -d "$domain" --force-renewal --non-interactive --agree-tos --register-unsafely-without-email 2>/dev/null || \
-                    certbot certonly --standalone -d "$domain" --force-renewal
-                else
-                    certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email 2>/dev/null || \
-                    certbot certonly --standalone -d "$domain"
-                fi
-                pasarguard up 2>/dev/null || true
-                if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-                    echo -e "  ${GREEN}OK: /etc/letsencrypt/live/${domain}/${NC}"
-                    echo "  Use option 4 to apply to panel."
-                else
-                    echo -e "  ${RED}Failed. Check DNS A record and port 80.${NC}"
-                fi
-                pause
-                ;;
-            3)
-                echo -e "  ${CYAN}Running certbot renew...${NC}"
-                certbot renew
-                echo
-                list_certs
-                pause
-                ;;
-            4)
-                list_certs
-                read -rp "  Domain to apply: " domain
-                if [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-                    echo -e "  ${RED}No certificate for ${domain}${NC}"; pause; continue
-                fi
-                [[ -f "$ENV_FILE" ]] || { echo "  .env missing"; pause; continue; }
-                sed -i '/^UVICORN_SSL_CERTFILE=/d' "$ENV_FILE"
-                sed -i '/^UVICORN_SSL_KEYFILE=/d' "$ENV_FILE"
-                sed -i '/^UVICORN_PORT=/d' "$ENV_FILE"
-                {
-                    echo "UVICORN_SSL_CERTFILE=/etc/letsencrypt/live/${domain}/fullchain.pem"
-                    echo "UVICORN_SSL_KEYFILE=/etc/letsencrypt/live/${domain}/privkey.pem"
-                    echo "UVICORN_PORT=443"
-                } >> "$ENV_FILE"
-                ufw allow 443/tcp 2>/dev/null || true
-                echo -e "  ${GREEN}Applied. Port=443. Restarting...${NC}"
-                pasarguard restart
-                show_links
-                pause
-                ;;
-            5)
-                read -rp "  CN (IP or domain): " cn
-                mkdir -p /var/lib/pasarguard/certs
-                openssl req -x509 -newkey rsa:4096 \
-                    -keyout /var/lib/pasarguard/certs/key.pem \
-                    -out /var/lib/pasarguard/certs/cert.pem \
-                    -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
-                echo -e "  ${GREEN}Created:${NC}"
-                echo "  /var/lib/pasarguard/certs/cert.pem"
-                echo "  /var/lib/pasarguard/certs/key.pem"
-                pause
-                ;;
-            6)
-                grep -E "SSL|UVICORN|CERT|KEY|PORT" "$ENV_FILE" 2>/dev/null || echo "  None"
-                pause
-                ;;
-            7) pasarguard edit-env ;;
-            8) pasarguard restart; pause ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_backup() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}4. Backup & Restore${NC}"
-        print_line
-        echo "  1. Manual backup"
-        echo "  2. Setup Telegram auto-backup"
-        echo "  3. Restore"
-        echo "  4. List backup files"
-        echo "  5. Show paths"
-        echo "  6. PostgreSQL dump"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-6]: " o
-        case $o in
-            1) pasarguard backup; pause ;;
-            2) pasarguard backup-service; pause ;;
-            3) pasarguard restore; pause ;;
-            4) ls -lh "$BACKUP_DIR" 2>/dev/null || echo "  Empty"; pause ;;
-            5)
-                echo "  Backup : $BACKUP_DIR"
-                echo "  App    : $APP_DIR"
-                echo "  Data   : $DATA_DIR"
-                pause
-                ;;
-            6)
-                OUT=~/pasarguard-db-$(date +%F-%H%M).dump
-                C=$(docker ps -qf "name=postgresql" | head -1)
-                if [[ -n "$C" ]]; then
-                    docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null && \
-                    docker cp "$C":/tmp/pg.dump "$OUT" && echo -e "  ${GREEN}$OUT${NC}"
-                else
-                    echo -e "  ${RED}No postgresql container${NC}"
-                fi
-                pause
-                ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_migrate() {
-    print_header
-    echo -e "  ${BOLD}5. Migrate to New Server${NC}"
-    print_line
-    read -rp "  Create migration package? (yes/no): " c
-    [[ "$c" != "yes" ]] && return
-    DIR=~/pasarguard-migrate-$(date +%F-%H%M)
-    mkdir -p "$DIR"
-    pasarguard backup 2>/dev/null || true
-    cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
-    cp -a "$ENV_FILE" "$DIR/env.backup" 2>/dev/null || true
-    cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
-    cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
-    ARC=~/pasarguard-migrate-$(date +%F-%H%M).tar.gz
-    tar -czvf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
-    echo -e "  ${GREEN}$ARC${NC}"
-    echo "  On new server: install panel -> restore -> fix .env -> restart"
-    pause
-}
-
-menu_settings() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}6. Panel Settings${NC}"
-        print_line
-        echo "  1. Generate temp key (owner/admin)"
-        echo "  2. Show panel link"
-        echo "  3. View .env"
-        echo "  4. Edit .env"
-        echo "  5. Edit docker-compose"
-        echo "  6. Show database URL"
-        echo "  7. Show versions"
-        echo "  8. Reset DB password (PostgreSQL)"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-8]: " o
-        case $o in
-            1)
-                pasarguard cli generate-temp-key
-                echo -e "  ${YELLOW}Use on login page > Owner access${NC}"
-                pause
-                ;;
-            2) show_links; pause ;;
-            3) [[ -f "$ENV_FILE" ]] && cat "$ENV_FILE" || echo "  missing"; pause ;;
-            4) pasarguard edit-env ;;
-            5) pasarguard edit ;;
-            6) grep -i SQLALCHEMY_DATABASE_URL "$ENV_FILE" 2>/dev/null || echo "  n/a"; pause ;;
-            7)
-                echo "  Manager: $SCRIPT_VERSION"
-                pasarguard version-script 2>/dev/null || true
-                docker images 2>/dev/null | grep -i pasarguard || true
-                pause
-                ;;
-            8)
-                read -rp "  New DB password: " npw
-                C=$(docker ps -qf "name=postgresql" | head -1)
-                if [[ -n "$C" && -n "$npw" ]]; then
-                    docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" 2>/dev/null && \
-                    echo -e "  ${GREEN}Updated. Also fix SQLALCHEMY_DATABASE_URL in .env${NC}"
-                else
-                    echo -e "  ${RED}Failed${NC}"
-                fi
-                pause
-                ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_node() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}7. Node Management${NC}"
-        print_line
-        echo "  1. Install node"
-        echo "  2. Install node (custom name)"
-        echo "  3. Show API Key"
-        echo "  4. Show Certificate"
-        echo "  5. Show node .env"
-        echo "  6. Edit node .env"
-        echo "  7. Node help/status"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-7]: " o
-        case $o in
-            1) bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install; pause ;;
-            2)
-                read -rp "  Name: " n
-                [[ -n "$n" ]] && bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install --name "$n"
-                pause
-                ;;
-            3)
-                for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do
-                    [[ -f "$f" ]] && { echo -e "  ${GREEN}$f${NC}"; grep -i API_KEY "$f" || true; }
-                done
-                pause
-                ;;
-            4)
-                for f in /var/lib/pg-node/certs/ssl_cert.pem /opt/pg-node/certs/ssl_cert.pem; do
-                    if [[ -f "$f" ]]; then
-                        echo -e "  ${GREEN}$f${NC}"
-                        cat "$f"
-                    fi
-                done
-                find /var/lib /opt -name ssl_cert.pem 2>/dev/null | head -5
-                pause
-                ;;
-            5)
-                for f in /opt/pg-node/.env /var/lib/pg-node/.env; do
-                    [[ -f "$f" ]] && { echo "=== $f ==="; cat "$f"; }
-                done
-                pause
-                ;;
-            6)
-                if [[ -f /opt/pg-node/.env ]]; then nano /opt/pg-node/.env
-                elif [[ -f /var/lib/pg-node/.env ]]; then nano /var/lib/pg-node/.env
-                else read -rp "  Path: " p; [[ -f "$p" ]] && nano "$p"; fi
-                ;;
-            7)
-                command -v pg-node &>/dev/null && { pg-node --help 2>/dev/null; pg-node status 2>/dev/null; } || echo "  pg-node not found"
-                pause
-                ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_firewall() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}8. Firewall & Security${NC}"
-        print_line
-        echo "  1. Install + enable UFW"
-        echo "  2. Allow SSH (22)"
-        echo "  3. Allow panel port"
-        echo "  4. Allow 80 and 443"
-        echo "  5. Allow custom port"
-        echo "  6. UFW status"
-        echo "  7. Enable BBR"
-        echo "  8. Install Fail2Ban"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-8]: " o
-        case $o in
-            1)
-                apt install -y ufw >/dev/null 2>&1
-                ufw default deny incoming; ufw default allow outgoing
-                ufw allow 22/tcp; ufw --force enable
-                echo -e "  ${GREEN}UFW on${NC}"; pause
-                ;;
-            2) ufw allow 22/tcp; echo "  OK"; pause ;;
-            3) p=$(get_port); ufw allow "${p}/tcp"; echo "  ${p} OK"; pause ;;
-            4) ufw allow 80/tcp; ufw allow 443/tcp; echo "  OK"; pause ;;
-            5) read -rp "  Port: " p; [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "${p}/tcp"; pause ;;
-            6) ufw status verbose; pause ;;
-            7)
-                if ! grep -q bbr /etc/sysctl.conf 2>/dev/null; then
-                    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-                    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-                    sysctl -p
-                fi
-                sysctl net.ipv4.tcp_congestion_control; pause
-                ;;
-            8)
-                apt install -y fail2ban >/dev/null 2>&1
-                systemctl enable --now fail2ban
-                echo -e "  ${GREEN}Fail2Ban on${NC}"; pause
-                ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-menu_tools() {
-    while true; do
-        print_header
-        echo -e "  ${BOLD}9. Tools${NC}"
-        print_line
-        echo "  1. Speedtest"
-        echo "  2. Disk usage"
-        echo "  3. Memory"
-        echo "  4. Listening ports"
-        echo "  5. Restart Docker"
-        echo "  6. Docker prune"
-        echo "  7. Update Geo files"
-        echo "  8. System info"
-        echo "  9. Panel link"
-        echo "  0. Back"
-        print_line
-        read -rp "  Choose option [0-9]: " o
-        case $o in
-            1)
-                command -v speedtest-cli >/dev/null || apt install -y speedtest-cli 2>/dev/null || true
-                speedtest-cli --simple 2>/dev/null || speedtest 2>/dev/null || echo "  n/a"
-                pause
-                ;;
-            2) df -h; pause ;;
-            3) free -h; pause ;;
-            4) ss -tlnp; pause ;;
-            5) systemctl restart docker; echo "  OK"; pause ;;
-            6) docker system prune -f; echo "  OK"; pause ;;
-            7)
-                mkdir -p /usr/local/share/xray
-                curl -fsSL -o /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>/dev/null
-                curl -fsSL -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat 2>/dev/null
-                echo -e "  ${GREEN}Geo updated${NC}"; pause
-                ;;
-            8)
-                echo "  Host: $(hostname)"
-                echo "  OS  : $(grep PRETTY /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
-                echo "  CPU : $(nproc) cores"
-                free -h | grep Mem; df -h / | tail -1
-                pause
-                ;;
-            9) show_links; pause ;;
-            0) break ;;
-            *) ;;
-        esac
-    done
-}
-
-# ── Main ─────────────────────────────────────────────────────
-main_menu() {
-    while true; do
-        print_header
-        if check_pg && [[ -f "$ENV_FILE" ]]; then
-            echo -e "  Panel: ${GREEN}$(panel_url)${NC}"
-            print_line
-        fi
-        echo "  0. Service Management"
-        echo "  1. Install / Update / Uninstall"
-        echo "  2. Panel Port & Links"
-        echo "  3. SSL Certificate Management"
-        echo "  4. Backup & Restore"
-        echo "  5. Migrate to New Server"
-        echo "  6. Panel Settings"
-        echo "  7. Node Management"
-        echo "  8. Firewall & Security"
-        echo "  9. Tools"
-        echo "  10. Quick Status"
-        echo "  11. Exit"
-        print_line
-        read -rp "  Choose option [0-11]: " c
-        case $c in
-            0) menu_service ;;
-            1) menu_install ;;
-            2) menu_port ;;
-            3) menu_ssl ;;
-            4) menu_backup ;;
-            5) menu_migrate ;;
-            6) menu_settings ;;
-            7) menu_node ;;
-            8) menu_firewall ;;
-            9) menu_tools ;;
-            10)
-                print_header
-                check_pg && pasarguard status || echo "  Panel not installed"
-                echo
-                show_links
-                df -h / | tail -1
-                free -h | grep Mem
-                pause
-                ;;
-            11) echo -e "  ${GREEN}Bye${NC}"; exit 0 ;;
-            *) ;;
-        esac
-    done
-}
-
-check_root
-main_menu
+need_root
+main
