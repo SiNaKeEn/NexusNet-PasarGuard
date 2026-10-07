@@ -14,12 +14,46 @@ DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
-SCRIPT_VERSION="1.10.0"
+SCRIPT_VERSION="1.11.1"
 
 hr()  { echo -e "${CYAN}  ────────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter to continue..."; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo -e "${RED}  Please run as root${NC}"; exit 1; }; }
 has_pg(){ command -v pasarguard &>/dev/null; }
+
+# Fix wrong PGDATA / volume mount (common after migration)
+fix_compose_volumes(){
+  local compose="${COMPOSE_FILE:-/opt/pasarguard/docker-compose.yml}"
+  [[ -f "$compose" ]] || return 0
+  local changed=0
+  if grep -qE '/var/lib/postgresql/pasarguard:/var/lib/postgresql["[:space:]]*$' "$compose" 2>/dev/null; then
+    sed -i 's|/var/lib/postgresql/pasarguard:/var/lib/postgresql|/var/lib/postgresql/pasarguard:/var/lib/postgresql/data|g' "$compose"
+    changed=1
+  fi
+  if grep -qE 'PGDATA:[[:space:]]*/var/lib/postgresql$' "$compose" 2>/dev/null; then
+    sed -i 's|PGDATA:[[:space:]]*/var/lib/postgresql|PGDATA: /var/lib/postgresql/data|g' "$compose"
+    changed=1
+  fi
+  [[ $changed -eq 1 ]] && echo -e "  ${GREEN}→ Fixed PostgreSQL volume mount in compose${NC}"
+  return 0
+}
+
+# Check if a TCP port is already in use
+port_in_use(){
+  local port="$1"
+  ss -tlnp 2>/dev/null | grep -qE ":${port}[[:space:]]" && return 0
+  return 1
+}
+
+# Safe restart with compose fix
+pg_restart(){
+  fix_compose_volumes
+  if has_pg; then
+    echo -e "  ${CYAN}→ Restarting panel...${NC}"
+    pasarguard restart 2>/dev/null || pasarguard up 2>/dev/null || true
+    sleep 2
+  fi
+}
 
 # ─── Status helpers ───────────────────────────────────────────
 _svc_status(){
@@ -187,9 +221,9 @@ m_service(){
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1) pasarguard up; pause ;;
+      1) fix_compose_volumes; pasarguard up; pause ;;
       2) pasarguard down; pause ;;
-      3) pasarguard restart; pause ;;
+      3) pg_restart; pause ;;
       4) pasarguard status; pause ;;
       5) pasarguard logs ;;
       6) pasarguard logs -n; pause ;;
@@ -242,13 +276,22 @@ m_port(){
     read -rp "  Select: " o
     case $o in
       1)
-        echo "  Current: $(get_port) | Suggest: 8443 2083 2053 2087"
+        echo -e "  Current: ${CYAN}$(get_port)${NC} | Suggest: 8443 2083 2053 2087 2096"
         read -rp "  New port: " np
         if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 && -f "$ENV_FILE" ]]; then
+          if port_in_use "$np"; then
+            echo -e "  ${YELLOW}Warning: port ${np} already in use:${NC}"
+            ss -tlnp 2>/dev/null | grep -E ":${np}[[:space:]]" || true
+            read -rp "  Continue anyway? [y/N]: " cont
+            [[ "$cont" =~ ^[Yy]$ ]] || { echo "  Cancelled"; pause; continue; }
+          fi
           grep -q '^UVICORN_PORT=' "$ENV_FILE" && sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE" || echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
           ufw allow "${np}/tcp" 2>/dev/null || true
-          pasarguard restart
+          echo -e "  ${GREEN}Port set to ${np}${NC}"
+          pg_restart
           show_info
+        else
+          echo -e "  ${RED}Invalid port or .env missing${NC}"
         fi
         pause
         ;;
@@ -305,14 +348,20 @@ apply_cert_env(){
   local dst="${DATA_DIR}/certs/${domain}"
   [[ -f "${dst}/fullchain.pem" && -f "${dst}/privkey.pem" ]] || { echo -e "  ${RED}Missing files in ${dst}${NC}"; return 1; }
   [[ -f "$ENV_FILE" ]] || { echo -e "  ${RED}No .env${NC}"; return 1; }
-  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^UVICORN_SSL_CA_TYPE=/d' "$ENV_FILE"
+  local current_port
+  current_port=$(get_port)
+  # Keep current port by default (don't force 443 — user may have 3x-ui or other on 443)
+  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_SSL_CA_TYPE=/d' "$ENV_FILE"
   {
     echo "UVICORN_SSL_CERTFILE=${dst}/fullchain.pem"
     echo "UVICORN_SSL_KEYFILE=${dst}/privkey.pem"
-    echo "UVICORN_PORT=443"
   } >> "$ENV_FILE"
-  ufw allow 443/tcp 2>/dev/null || true
-  echo -e "  ${GREEN}.env → panel path + port 443${NC}"
+  # Only ensure UVICORN_PORT exists; do not override user's chosen port
+  if ! grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
+    echo "UVICORN_PORT=${current_port}" >> "$ENV_FILE"
+  fi
+  ufw allow "${current_port}/tcp" 2>/dev/null || true
+  echo -e "  ${GREEN}.env → SSL paths set (port kept: ${current_port})${NC}"
 }
 
 cert_covers_domain(){
@@ -751,17 +800,19 @@ if [[ -d /var/lib/pasarguard/certs ]]; then
 fi
 
 if [[ -f /opt/pasarguard/.env ]]; then
-  sed -i "/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^#UVICORN_PORT=/d" /opt/pasarguard/.env
+  # Only strip SSL lines; keep existing UVICORN_PORT from backup
+  sed -i "/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d" /opt/pasarguard/.env
 fi
 
 if [[ -n "$FOUND_CERT" && -f "$FOUND_CERT" && -f "$FOUND_KEY" ]]; then
   echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> /opt/pasarguard/.env
   echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> /opt/pasarguard/.env
-  echo "UVICORN_PORT=443" >> /opt/pasarguard/.env
-  echo "→ SSL applied (domain: ${FOUND_DOMAIN}, port 443)"
+  echo "→ SSL applied (domain: ${FOUND_DOMAIN}) — port left as in .env backup"
 else
-  echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
-  echo "→ No valid cert — panel starts HTTP on 8000"
+  if ! grep -q '^UVICORN_PORT=' /opt/pasarguard/.env 2>/dev/null; then
+    echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
+  fi
+  echo "→ No valid cert — using existing/default port"
 fi
 
 # Copy backup files for later restore
@@ -857,15 +908,27 @@ m_settings(){
     read -rp "  Select: " o
     case $o in
       1)
+        echo -e "  Current port: ${CYAN}$(get_port)${NC}"
+        echo "  Suggested: 8443  2083  2053  2087  2096"
         read -rp "  New port: " np
-        if [[ "$np" =~ ^[0-9]+$ ]]; then
+        if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 ]]; then
+          if port_in_use "$np"; then
+            echo -e "  ${YELLOW}Warning: port ${np} is already in use:${NC}"
+            ss -tlnp 2>/dev/null | grep -E ":${np}[[:space:]]" || true
+            read -rp "  Continue anyway? [y/N]: " cont
+            [[ "$cont" =~ ^[Yy]$ ]] || { echo "  Cancelled"; pause; continue; }
+          fi
           if grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
             sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE"
           else
             echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
           fi
+          ufw allow "${np}/tcp" 2>/dev/null || true
           echo -e "  ${GREEN}Port set to ${np}${NC}"
-          echo "  Restart panel to apply"
+          pg_restart
+          show_info
+        else
+          echo -e "  ${RED}Invalid port${NC}"
         fi
         pause
         ;;
@@ -955,16 +1018,18 @@ m_database(){
         header
         echo -e "  ${BOLD}Fix PostgreSQL / Recover${NC}"; hr
         echo -e "  ${YELLOW}This will:${NC}"
+        echo "  • Try automatic backup first"
         echo "  • Stop all panel containers"
         echo "  • Remove PostgreSQL data directory"
-        echo "  • Fix wrong volume mount in docker-compose (if needed)"
+        echo "  • Fix wrong volume mount in docker-compose"
         echo "  • Start panel again (fresh DB)"
         echo
-        echo -e "  ${RED}WARNING: Current DB data will be lost!${NC}"
-        echo "  Make sure you have a backup before continuing."
+        echo -e "  ${RED}WARNING: Current DB data will be lost if no backup!${NC}"
         echo
         read -rp "  Continue? [y/N]: " conf
         if [[ "$conf" =~ ^[Yy]$ ]]; then
+          echo -e "  ${CYAN}→ Trying backup before clean...${NC}"
+          pasarguard backup 2>/dev/null && echo -e "  ${GREEN}Backup done${NC}" || echo -e "  ${YELLOW}Backup skipped/failed (continue anyway)${NC}"
           echo -e "  ${CYAN}→ Stopping...${NC}"
           pasarguard down 2>/dev/null || true
           docker rm -f $(docker ps -aq --filter name=pasarguard) 2>/dev/null || true
@@ -975,16 +1040,7 @@ m_database(){
           docker volume rm $(docker volume ls -q | grep -E 'pasarguard|pgadmin') 2>/dev/null || true
           rm -rf /var/lib/postgresql/pasarguard
           rm -rf /var/lib/postgresql/*
-          # Fix compose if wrong mount
-          if [[ -f "$COMPOSE_FILE" ]]; then
-            if grep -qE '/var/lib/postgresql/pasarguard:/var/lib/postgresql["[:space:]]*$' "$COMPOSE_FILE"; then
-              echo -e "  ${CYAN}→ Fixing volume mount path...${NC}"
-              sed -i 's|/var/lib/postgresql/pasarguard:/var/lib/postgresql|/var/lib/postgresql/pasarguard:/var/lib/postgresql/data|g' "$COMPOSE_FILE"
-            fi
-            if grep -q 'PGDATA: /var/lib/postgresql$' "$COMPOSE_FILE"; then
-              sed -i 's|PGDATA: /var/lib/postgresql|PGDATA: /var/lib/postgresql/data|g' "$COMPOSE_FILE"
-            fi
-          fi
+          fix_compose_volumes
           echo -e "  ${CYAN}→ Starting...${NC}"
           pasarguard up
           sleep 3
@@ -1243,16 +1299,18 @@ EOF
         fi
         mkdir -p /opt/pasarguard
         touch "$ENV_FILE"
-        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^#UVICORN_PORT=/d' "$ENV_FILE"
+        local cur_port
+        cur_port=$(get_port)
+        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d' "$ENV_FILE"
         echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> "$ENV_FILE"
         echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> "$ENV_FILE"
-        echo "UVICORN_PORT=443" >> "$ENV_FILE"
-        echo -e "  ${GREEN}Applied:${NC} $FOUND_DOMAIN → port 443"
-        echo "  Free port 443 if needed, then: pasarguard restart"
+        if ! grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
+          echo "UVICORN_PORT=${cur_port}" >> "$ENV_FILE"
+        fi
+        echo -e "  ${GREEN}Applied:${NC} $FOUND_DOMAIN (port kept: ${cur_port})"
         read -rp "  Restart panel now? [Y/n]: " yn
         if [[ "${yn:-Y}" =~ ^[Yy]$ ]]; then
-          fuser -k 443/tcp 2>/dev/null || true
-          pasarguard restart 2>/dev/null || true
+          pg_restart
           pasarguard status 2>/dev/null || true
         fi
         pause
