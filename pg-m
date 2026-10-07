@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.4.0
+#  PasarGuard Manager (pg-m)  v1.5.0
 #  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -12,7 +12,7 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 
 hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter..."; }
@@ -208,104 +208,221 @@ m_port(){
 }
 
 # ─────────────────── 3 SSL ───────────────────
+# Panel container ONLY sees files under DATA_DIR (/var/lib/pasarguard).
+# Never point UVICORN_SSL_* at /etc/letsencrypt directly.
+
+copy_cert_to_panel(){
+  local domain="$1"
+  local src=""
+  # Prefer exact live dir; also accept first domain as folder name for multi-SAN certs
+  if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+    src="/etc/letsencrypt/live/${domain}"
+  else
+    # multi-domain certs live under the first -d name
+    for d in /etc/letsencrypt/live/*/; do
+      [[ -f "${d}fullchain.pem" ]] || continue
+      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}"; then
+        src="${d%/}"
+        break
+      fi
+    done
+  fi
+  [[ -n "$src" && -f "${src}/fullchain.pem" ]] || { echo -e "  ${RED}No LE cert covering ${domain}${NC}"; return 1; }
+  local dst="${DATA_DIR}/certs/${domain}"
+  mkdir -p "$dst"
+  cp -L "${src}/fullchain.pem" "${dst}/fullchain.pem"
+  cp -L "${src}/privkey.pem" "${dst}/privkey.pem"
+  chmod 644 "${dst}/fullchain.pem"
+  chmod 600 "${dst}/privkey.pem"
+  echo -e "  ${GREEN}Copied → ${dst}${NC} (from ${src})"
+}
+
+apply_cert_env(){
+  local domain="$1"
+  local dst="${DATA_DIR}/certs/${domain}"
+  [[ -f "${dst}/fullchain.pem" && -f "${dst}/privkey.pem" ]] || { echo -e "  ${RED}Missing files in ${dst}${NC}"; return 1; }
+  [[ -f "$ENV_FILE" ]] || { echo -e "  ${RED}No .env${NC}"; return 1; }
+  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^UVICORN_SSL_CA_TYPE=/d' "$ENV_FILE"
+  {
+    echo "UVICORN_SSL_CERTFILE=${dst}/fullchain.pem"
+    echo "UVICORN_SSL_KEYFILE=${dst}/privkey.pem"
+    echo "UVICORN_PORT=443"
+  } >> "$ENV_FILE"
+  ufw allow 443/tcp 2>/dev/null || true
+  echo -e "  ${GREEN}.env → panel path + port 443${NC}"
+}
+
+cert_covers_domain(){
+  local pem="$1" domain="$2"
+  [[ -f "$pem" ]] || return 1
+  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -qE "DNS:${domain}(,|$| )" && return 0
+  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}" && return 0
+  return 1
+}
+
+ssl_health(){
+  echo -e "  ${BOLD}SSL Health Check${NC}"; hr
+  echo -e "  ${CYAN}[.env]${NC}"
+  local cert key port
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  key=$(get_env UVICORN_SSL_KEYFILE)
+  port=$(get_port)
+  echo "  CERTFILE = ${cert:-<empty>}"
+  echo "  KEYFILE  = ${key:-<empty>}"
+  echo "  PORT     = ${port}"
+  if [[ -z "$cert" || -z "$key" ]]; then
+    echo -e "  ${RED}SSL not set in .env${NC}"
+  elif [[ "$cert" == /etc/letsencrypt/* ]]; then
+    echo -e "  ${RED}BAD: .env points to /etc/letsencrypt (container cannot read it)${NC}"
+  elif [[ -f "$cert" && -f "$key" ]]; then
+    echo -e "  ${GREEN}Files exist on host${NC}"
+    echo -n "  Expiry: "; openssl x509 -in "$cert" -noout -enddate 2>/dev/null || true
+    echo "  SANs:"
+    openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/    /' || true
+  else
+    echo -e "  ${RED}Cert/key path missing on host${NC}"
+  fi
+  hr
+  echo -e "  ${CYAN}[Let's Encrypt live]${NC}"
+  if [[ -d /etc/letsencrypt/live ]]; then
+    for d in /etc/letsencrypt/live/*/; do
+      n=$(basename "$d"); [[ "$n" == README ]] && continue
+      [[ -f "${d}fullchain.pem" ]] || continue
+      echo -n "  • $n  "
+      if openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then echo -e "${GREEN}valid${NC}"; else echo -e "${RED}expired${NC}"; fi
+      openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/      /'
+    done
+  else
+    echo "  (none)"
+  fi
+  hr
+  echo -e "  ${CYAN}[Panel data certs]${NC}"
+  ls -la "${DATA_DIR}/certs/" 2>/dev/null || echo "  (empty)"
+  hr
+  echo -e "  ${CYAN}[Listen + local HTTPS]${NC}"
+  ss -tlnp | grep -E ':443|:8000' || echo "  nothing on 443/8000"
+  curl -sI --max-time 5 -k "https://127.0.0.1/dashboard/" 2>/dev/null | head -2 || echo "  local HTTPS failed"
+  hr
+  echo -e "  ${CYAN}[SNI test panel vs subs]${NC}"
+  for host in panel.nexus-net.online subs.nexus-net.online; do
+    echo -n "  $host → "
+    echo | openssl s_client -connect 127.0.0.1:443 -servername "$host" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "fail"
+  done
+  hr
+}
+
 m_ssl(){
   while true; do
     header
     echo -e "  ${BOLD}3. SSL Certificate${NC}"; hr
-    echo "  1. List certificates (status)"
-    echo "  2. Issue new certificate"
-    echo "  3. Renew all (certbot renew)"
-    echo "  4. Apply cert to panel"
-    echo "  5. Delete / revoke certificate"
-    echo "  6. Self-signed certificate"
-    echo "  7. Show .env SSL lines"
-    echo "  8. Edit .env"
-    echo "  9. Restart panel"
+    echo "  1. SSL health check / debug"
+    echo "  2. List Let's Encrypt certs"
+    echo "  3. Issue cert (one or more domains) + apply"
+    echo "  4. Fix paths only (copy existing LE → panel + .env)"
+    echo "  5. Renew all + re-copy to panel"
+    echo "  6. Delete / revoke certificate"
+    echo "  7. Self-signed"
+    echo "  8. Show .env SSL lines"
+    echo "  9. Edit .env"
+    echo "  10. Restart panel"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1) list_certs; pause ;;
-      2)
-        list_certs
-        read -rp "  Domain: " domain
-        [[ -z "$domain" ]] && continue
-        if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-          echo -e "  ${YELLOW}Already exists for ${domain}${NC}"
-          read -rp "  Force re-issue? (yes/no): " force
-          [[ "$force" != yes ]] && { echo "  Use Renew instead."; pause; continue; }
+      1) ssl_health; pause ;;
+      2) list_certs; pause ;;
+      3)
+        echo "  Examples:"
+        echo "    panel.example.com"
+        echo "    panel.example.com subs.example.com   (multi-domain / SAN)"
+        read -rp "  Domain(s): " domains
+        [[ -z "$domains" ]] && continue
+        primary=$(echo "$domains" | awk '{print $1}')
+        # If all domains already covered by one valid cert, only fix paths
+        all_ok=1
+        for host in $domains; do
+          found=0
+          for d in /etc/letsencrypt/live/*/; do
+            [[ -f "${d}fullchain.pem" ]] || continue
+            if cert_covers_domain "${d}fullchain.pem" "$host"; then found=1; break; fi
+          done
+          [[ $found -eq 1 ]] || all_ok=0
+        done
+        if [[ $all_ok -eq 1 ]]; then
+          echo -e "  ${GREEN}Valid cert already covers: ${domains}${NC}"
+          echo "  Skipping certbot. Fixing panel paths only..."
+          copy_cert_to_panel "$primary"
+          apply_cert_env "$primary"
+          # also copy under each name for clarity
+          for host in $domains; do copy_cert_to_panel "$host" 2>/dev/null || true; done
+          pasarguard restart
+          ssl_health
+          pause
+          continue
         fi
         apt install -y certbot >/dev/null 2>&1 || true
         ufw allow 80/tcp 2>/dev/null || true
-        free_port_80 || { echo -e "  ${RED}Cannot free port 80${NC}"; pause; continue; }
-        if [[ "${force:-}" == yes ]]; then
-          certbot certonly --standalone -d "$domain" --force-renewal --non-interactive --agree-tos --register-unsafely-without-email || \
-          certbot certonly --standalone -d "$domain" --force-renewal
-        else
-          certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email || \
-          certbot certonly --standalone -d "$domain"
-        fi
+        free_port_80 || { echo -e "  ${RED}Port 80 busy${NC}"; pause; continue; }
+        cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email)
+        for host in $domains; do cb+=(-d "$host"); done
+        "${cb[@]}" || certbot certonly --standalone $(for host in $domains; do echo -n " -d $host"; done)
         has_pg && pasarguard up 2>/dev/null || true
-        if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-          echo -e "  ${GREEN}Success. Use option 4 to apply.${NC}"
+        if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]] || ls /etc/letsencrypt/live/*/fullchain.pem >/dev/null 2>&1; then
+          for host in $domains; do copy_cert_to_panel "$host" || true; done
+          apply_cert_env "$primary"
+          pasarguard restart
+          ssl_health
         else
-          echo -e "  ${RED}Failed. Check DNS A record → this server IP.${NC}"
+          echo -e "  ${RED}certbot failed${NC}"
+          has_pg && pasarguard up 2>/dev/null || true
         fi
-        pause
-        ;;
-      3)
-        certbot renew
-        list_certs
         pause
         ;;
       4)
-        list_certs
-        read -rp "  Domain to apply: " domain
-        [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]] && { echo "  Not found"; pause; continue; }
-        [[ -f "$ENV_FILE" ]] || { echo "  No .env"; pause; continue; }
-        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d' "$ENV_FILE"
-        {
-          echo "UVICORN_SSL_CERTFILE=/etc/letsencrypt/live/${domain}/fullchain.pem"
-          echo "UVICORN_SSL_KEYFILE=/etc/letsencrypt/live/${domain}/privkey.pem"
-          echo "UVICORN_PORT=443"
-        } >> "$ENV_FILE"
-        ufw allow 443/tcp 2>/dev/null || true
+        read -rp "  Primary domain (used in .env, e.g. panel.nexus-net.online): " primary
+        [[ -z "$primary" ]] && continue
+        copy_cert_to_panel "$primary" && apply_cert_env "$primary"
+        read -rp "  Extra domain names to copy folders for (optional, space-separated): " extras
+        for host in $extras; do copy_cert_to_panel "$host" || true; done
         pasarguard restart
-        show_info
+        ssl_health
         pause
         ;;
       5)
+        certbot renew
+        for d in /etc/letsencrypt/live/*/; do
+          n=$(basename "$d"); [[ "$n" == README ]] && continue
+          copy_cert_to_panel "$n" || true
+        done
+        echo -e "  ${YELLOW}Restart panel to load renewed files?${NC}"
+        read -rp "  yes/no: " r
+        [[ "$r" == yes ]] && pasarguard restart
+        ssl_health
+        pause
+        ;;
+      6)
         list_certs
         read -rp "  Domain to delete: " domain
         [[ -z "$domain" ]] && continue
-        if [[ ! -d "/etc/letsencrypt/live/${domain}" ]]; then
-          echo "  Not found"; pause; continue
-        fi
-        echo -e "  ${RED}This removes the certificate for ${domain}${NC}"
         read -rp "  Type yes: " c
         if [[ "$c" == yes ]]; then
           certbot revoke --cert-path "/etc/letsencrypt/live/${domain}/fullchain.pem" --non-interactive 2>/dev/null || true
           certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || \
-          rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
-          echo -e "  ${GREEN}Deleted ${domain}${NC}"
-          # clean .env if pointing to this cert
-          if grep -q "/live/${domain}/" "$ENV_FILE" 2>/dev/null; then
-            echo -e "  ${YELLOW}.env still points to this domain. Edit SSL settings.${NC}"
-          fi
+            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
+          rm -rf "${DATA_DIR}/certs/${domain}" 2>/dev/null || true
+          echo -e "  ${GREEN}Removed ${domain}${NC}"
         fi
         pause
         ;;
-      6)
-        read -rp "  CN (IP/domain): " cn
-        mkdir -p /var/lib/pasarguard/certs
-        openssl req -x509 -newkey rsa:4096 -keyout /var/lib/pasarguard/certs/key.pem \
-          -out /var/lib/pasarguard/certs/cert.pem -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
-        echo "  /var/lib/pasarguard/certs/cert.pem"
-        echo "  /var/lib/pasarguard/certs/key.pem"
-        pause
+      7)
+        read -rp "  CN: " cn
+        mkdir -p "${DATA_DIR}/certs"
+        openssl req -x509 -newkey rsa:4096 -keyout "${DATA_DIR}/certs/key.pem" \
+          -out "${DATA_DIR}/certs/cert.pem" -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
+        echo "  ${DATA_DIR}/certs/cert.pem"; pause
         ;;
-      7) grep -E 'SSL|UVICORN|CERT|KEY|PORT' "$ENV_FILE" 2>/dev/null || echo "  none"; pause ;;
-      8) pasarguard edit-env ;;
-      9) pasarguard restart; pause ;;
+      8) grep -E 'SSL|UVICORN|CERT|KEY|PORT' "$ENV_FILE" 2>/dev/null || echo none; pause ;;
+      9) pasarguard edit-env ;;
+      10) pasarguard restart; pause ;;
       0) break ;;
     esac
   done
