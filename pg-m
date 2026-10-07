@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.6.0
+#  PasarGuard Manager (pg-m)  v1.7.0
 #  x-ui style management menu for PasarGuard
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -12,7 +12,7 @@ APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
 BACKUP_DIR="${APP_DIR}/backup"
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 
 hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
 pause(){ echo; read -rp "  Press Enter..."; }
@@ -115,14 +115,17 @@ list_certs(){
   hr
 }
 
-# ─────────────────── 0 Service ───────────────────
+# ─────────────────── 2 Service ───────────────────
 m_service(){
   while true; do
     header
-    echo -e "  ${BOLD}0. Service${NC}"; hr
-    echo "  1. Start          2. Stop"
-    echo "  3. Restart        4. Status"
-    echo "  5. Logs (live)    6. Logs (once)"
+    echo -e "  ${BOLD}2. Service Management${NC}"; hr
+    echo "  1. Start"
+    echo "  2. Stop"
+    echo "  3. Restart"
+    echo "  4. Status"
+    echo "  5. Logs (live)"
+    echo "  6. Logs (last lines)"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -148,8 +151,9 @@ m_install(){
     echo "  4. Install MySQL"
     echo "  5. Install MariaDB"
     echo "  6. Update panel"
-    echo "  7. Uninstall panel"
-    echo "  8. Reinstall CLI script"
+    echo "  7. Update to Pre-release / Dev"
+    echo "  8. Uninstall panel"
+    echo "  9. Reinstall CLI script"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -159,8 +163,9 @@ m_install(){
       4) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mysql; pause ;;
       5) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mariadb; pause ;;
       6) pasarguard update; pause ;;
-      7) read -rp "  Type yes to uninstall: " c; [[ "$c" == yes ]] && pasarguard uninstall; pause ;;
-      8) pasarguard install-script; pause ;;
+      7) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --pre-release; pause ;;
+      8) read -rp "  Type yes to uninstall: " c; [[ "$c" == yes ]] && pasarguard uninstall; pause ;;
+      9) pasarguard install-script; pause ;;
       0) break ;;
     esac
   done
@@ -314,17 +319,17 @@ ssl_health(){
 m_ssl(){
   while true; do
     header
-    echo -e "  ${BOLD}3. SSL Certificate${NC}"; hr
+    echo -e "  ${BOLD}4. SSL Certificate Management${NC}"; hr
     echo "  1. SSL health check / debug"
     echo "  2. List Let's Encrypt certs"
-    echo "  3. Issue cert (one or more domains) + apply"
-    echo "  4. Fix paths only (copy existing LE → panel + .env)"
+    echo "  3. Issue cert (domain) + apply"
+    echo "  4. Fix paths (copy LE → panel + .env)"
     echo "  5. Renew all + re-copy to panel"
     echo "  6. Delete / revoke certificate"
-    echo "  7. Self-signed"
+    echo "  7. Self-signed certificate"
     echo "  8. Show .env SSL lines"
     echo "  9. Edit .env"
-    echo "  10. Restart panel"
+    echo " 10. Restart panel"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -432,7 +437,7 @@ m_ssl(){
 m_backup(){
   while true; do
     header
-    echo -e "  ${BOLD}4. Backup & Restore${NC}"; hr
+    echo -e "  ${BOLD}5. Backup & Restore${NC}"; hr
     echo "  1. Manual backup"
     echo "  2. Telegram auto-backup"
     echo "  3. Restore"
@@ -466,7 +471,7 @@ m_backup(){
 m_migrate(){
   while true; do
     header
-    echo -e "  ${BOLD}5. Migrate to New Server${NC}"; hr
+    echo -e "  ${BOLD}6. Migrate to New Server${NC}"; hr
     echo "  1. Create migration package only"
     echo "  2. Full Auto Transfer (package + upload + remote install + restore)"
     echo "  3. Help / How it works"
@@ -687,33 +692,93 @@ echo "════════════════════════�
   done
 }
 
-# ─────────────────── 6 Settings ───────────────────
+# ─────────────────── 3 Panel Settings ───────────────────
 m_settings(){
   while true; do
     header
-    echo -e "  ${BOLD}6. Panel Settings${NC}"; hr
-    echo "  1. Temp key (owner)"
-    echo "  2. Show panel link"
-    echo "  3. View .env"
-    echo "  4. Edit .env"
-    echo "  5. Edit compose"
-    echo "  6. DB URL"
-    echo "  7. Versions"
-    echo "  8. Reset PG password"
+    echo -e "  ${BOLD}3. Panel Settings${NC}"; hr
+    show_info
+    echo "  1. Change panel port"
+    echo "  2. Open firewall for panel port"
+    echo "  3. Temp key (owner reset)"
+    echo "  4. Show access links"
+    echo "  5. View .env"
+    echo "  6. Edit .env"
+    echo "  7. Edit docker-compose"
+    echo "  8. Versions"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1) pasarguard cli generate-temp-key; pause ;;
-      2) show_info; pause ;;
-      3) cat "$ENV_FILE" 2>/dev/null || echo missing; pause ;;
-      4) pasarguard edit-env ;;
-      5) pasarguard edit ;;
-      6) grep -i SQLALCHEMY_DATABASE_URL "$ENV_FILE" 2>/dev/null || true; pause ;;
-      7) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -i pasarguard || true; pause ;;
-      8)
+      1)
+        read -rp "  New port: " np
+        if [[ "$np" =~ ^[0-9]+$ ]]; then
+          if grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
+            sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE"
+          else
+            echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
+          fi
+          echo -e "  ${GREEN}Port set to ${np}${NC}"
+          echo "  Restart panel to apply"
+        fi
+        pause
+        ;;
+      2)
+        p=$(get_port)
+        ufw allow "${p}/tcp" 2>/dev/null || true
+        echo -e "  ${GREEN}Opened port ${p}${NC}"
+        pause
+        ;;
+      3) pasarguard cli generate-temp-key; pause ;;
+      4) show_info; pause ;;
+      5) cat "$ENV_FILE" 2>/dev/null || echo missing; pause ;;
+      6) pasarguard edit-env ;;
+      7) pasarguard edit ;;
+      8) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -i pasarguard || true; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── 9 Database ───────────────────
+m_database(){
+  while true; do
+    header
+    echo -e "  ${BOLD}9. Database Management${NC}"; hr
+    echo "  1. Show DB URL / type"
+    echo "  2. Reset PostgreSQL password"
+    echo "  3. PostgreSQL dump"
+    echo "  4. List Docker DB containers"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        grep -iE 'SQLALCHEMY_DATABASE_URL|DATABASE|DB_' "$ENV_FILE" 2>/dev/null || echo "  no env"
+        pause
+        ;;
+      2)
         read -rp "  New password: " npw
         C=$(docker ps -qf name=postgresql | head -1)
-        [[ -n "$C" && -n "$npw" ]] && docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" && echo OK
+        if [[ -n "$C" && -n "$npw" ]]; then
+          docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" && echo -e "  ${GREEN}OK${NC}"
+        else
+          echo "  No PostgreSQL container or empty password"
+        fi
+        pause
+        ;;
+      3)
+        OUT=~/pg-$(date +%F-%H%M).dump
+        C=$(docker ps -qf name=postgresql | head -1)
+        if [[ -n "$C" ]]; then
+          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
+          docker cp "$C":/tmp/pg.dump "$OUT"
+          echo -e "  ${GREEN}$OUT${NC}"
+        else
+          echo "  no PostgreSQL container"
+        fi
+        pause
+        ;;
+      4)
+        docker ps -a --filter name=postgres --filter name=mysql --filter name=mariadb --filter name=timescale
         pause
         ;;
       0) break ;;
@@ -725,7 +790,7 @@ m_settings(){
 m_node(){
   while true; do
     header
-    echo -e "  ${BOLD}7. Node${NC}"; hr
+    echo -e "  ${BOLD}7. Node Management${NC}"; hr
     echo "  1. Install node"
     echo "  2. Install custom name"
     echo "  3. Show API Key"
@@ -766,7 +831,7 @@ m_node(){
 m_firewall(){
   while true; do
     header
-    echo -e "  ${BOLD}8. Firewall & IP Limit${NC}"; hr
+    echo -e "  ${BOLD}8. Firewall & Security${NC}"; hr
     echo "  1. Install + enable UFW"
     echo "  2. Allow SSH 22"
     echo "  3. Allow panel port"
@@ -776,8 +841,8 @@ m_firewall(){
     echo "  7. Enable BBR"
     echo "  8. Install Fail2Ban"
     echo "  9. IP Limit - allow only my IP to panel"
-    echo "  10. IP Limit - add allowed IP"
-    echo "  11. IP Limit - list / reset panel rules"
+    echo " 10. IP Limit - add allowed IP"
+    echo " 11. IP Limit - list / reset panel rules"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -851,16 +916,21 @@ m_firewall(){
   done
 }
 
-# ─────────────────── 9 Tools ───────────────────
+# ─────────────────── 10 Tools ───────────────────
 m_tools(){
   while true; do
     header
-    echo -e "  ${BOLD}9. Tools${NC}"; hr
-    echo "  1. Speedtest          2. Disk"
-    echo "  3. Memory             4. Ports"
-    echo "  5. Restart Docker     6. Docker prune"
-    echo "  7. Update Geo files   8. System info"
-    echo "  9. Panel link         10. Who uses port 80"
+    echo -e "  ${BOLD}10. Tools & Utilities${NC}"; hr
+    echo "  1. Speedtest"
+    echo "  2. Disk usage"
+    echo "  3. Memory"
+    echo "  4. Listening ports"
+    echo "  5. Restart Docker"
+    echo "  6. Docker prune"
+    echo "  7. Update Geo files"
+    echo "  8. System info"
+    echo "  9. Panel link"
+    echo " 10. Who uses port 80"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -896,38 +966,41 @@ main(){
     if has_pg && [[ -f "$ENV_FILE" ]]; then
       echo -e "  ${GREEN}$(panel_url)${NC}"; hr
     fi
-    echo "  0. Service Management"
+    echo "  0. Exit"
+    hr
     echo "  1. Install / Update / Uninstall"
-    echo "  2. Port & Access Links"
-    echo "  3. SSL Certificate"
-    echo "  4. Backup & Restore"
-    echo "  5. Migrate to New Server"
-    echo "  6. Panel Settings"
+    echo "  2. Service Management"
+    echo "  3. Panel Settings"
+    echo "  4. SSL Certificate Management"
+    echo "  5. Backup & Restore"
+    echo "  6. Migrate to New Server"
+    hr
     echo "  7. Node Management"
-    echo "  8. Firewall & IP Limit"
-    echo "  9. Tools"
-    echo "  10. Quick Status"
-    echo "  11. Exit"; hr
+    echo "  8. Firewall & Security"
+    echo "  9. Database Management"
+    hr
+    echo " 10. Tools & Utilities"
+    echo " 11. Quick Status"; hr
     read -rp "  Select [0-11]: " c
     case $c in
-      0) m_service ;;
+      0) echo "  Bye"; exit 0 ;;
       1) m_install ;;
-      2) m_port ;;
-      3) m_ssl ;;
-      4) m_backup ;;
-      5) m_migrate ;;
-      6) m_settings ;;
+      2) m_service ;;
+      3) m_settings ;;
+      4) m_ssl ;;
+      5) m_backup ;;
+      6) m_migrate ;;
       7) m_node ;;
       8) m_firewall ;;
-      9) m_tools ;;
-      10)
+      9) m_database ;;
+      10) m_tools ;;
+      11)
         header
         has_pg && pasarguard status || echo "  not installed"
         echo; show_info
         df -h / | tail -1; free -h | grep Mem
         pause
         ;;
-      11) echo "  Bye"; exit 0 ;;
     esac
   done
 }
