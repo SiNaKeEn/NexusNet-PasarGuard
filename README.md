@@ -1,163 +1,1098 @@
-[README.md](https://github.com/user-attachments/files/33150848/README.md)
-<div align="center">
 
-# 🛡️ PasarGuard Manager
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+#  PasarGuard Manager (pg-m)  v1.8.0
+#  x-ui style management menu for PasarGuard
+# ═══════════════════════════════════════════════════════════════
+set -euo pipefail
 
-### x-ui style terminal management menu for PasarGuard Panel & Node
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
 
-**Version 1.8.0**
+APP_DIR="/opt/pasarguard"
+DATA_DIR="/var/lib/pasarguard"
+ENV_FILE="${APP_DIR}/.env"
+BACKUP_DIR="${APP_DIR}/backup"
+SCRIPT_VERSION="1.8.0"
 
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
-[![PasarGuard](https://img.shields.io/badge/PasarGuard-Compatible-orange.svg)](https://github.com/PasarGuard)
+hr()  { echo -e "${CYAN}  ──────────────────────────────────────────────${NC}"; }
+pause(){ echo; read -rp "  Press Enter..."; }
+need_root(){ [[ $EUID -eq 0 ]] || { echo -e "${RED}  Run as root${NC}"; exit 1; }; }
+has_pg(){ command -v pasarguard &>/dev/null; }
 
-One command. Full control.
+header(){
+  clear
+  echo -e "${GREEN}"
+  echo "  ╔══════════════════════════════════════════════╗"
+  echo "  ║     PasarGuard Manager  v${SCRIPT_VERSION}              ║"
+  echo "  ╚══════════════════════════════════════════════╝"
+  echo -e "${NC}"
+}
 
-</div>
+get_env(){
+  local k="$1"
+  [[ -f "$ENV_FILE" ]] && grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ' || true
+}
 
----
+_CACHED_IP=""
+get_ip(){
+  # Cache IP for this session (avoid slow external calls)
+  if [[ -n "$_CACHED_IP" ]]; then
+    echo "$_CACHED_IP"
+    return
+  fi
+  _CACHED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [[ -z "$_CACHED_IP" ]]; then
+    _CACHED_IP=$(curl -s4 --max-time 2 ifconfig.me 2>/dev/null || curl -s4 --max-time 2 api.ipify.org 2>/dev/null || echo "unknown")
+  fi
+  echo "$_CACHED_IP"
+}
 
-## 🚀 Quick Install
+get_domain_from_cert(){
+  local cert domain
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  [[ -z "$cert" ]] && return
+  if echo "$cert" | grep -qE 'certs/[^/]+/'; then
+    domain=$(echo "$cert" | sed -n 's|.*/certs/\([^/]*\)/.*|\1|p')
+  elif echo "$cert" | grep -q 'letsencrypt/live/'; then
+    domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
+  fi
+  echo "$domain"
+}
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/install.sh)
-```
+get_port(){
+  local p; p=$(get_env UVICORN_PORT); echo "${p:-8000}"
+}
 
-After installation just type:
+panel_url(){
+  local ip port scheme cert domain
+  ip=$(get_ip); port=$(get_port); cert=$(get_env UVICORN_SSL_CERTFILE)
+  domain=$(get_domain_from_cert)
+  [[ -n "$cert" ]] && scheme=https || scheme=http
+  if [[ -n "$domain" && "$scheme" == "https" ]]; then
+    if [[ "$port" == "443" ]]; then
+      echo "${scheme}://${domain}/dashboard/"
+    else
+      echo "${scheme}://${domain}:${port}/dashboard/"
+    fi
+  else
+    if [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; then
+      echo "${scheme}://${ip}/dashboard/"
+    else
+      echo "${scheme}://${ip}:${port}/dashboard/"
+    fi
+  fi
+}
 
-```bash
-pg-m
-```
+show_info(){
+  local cert domain ip port
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  domain=$(get_domain_from_cert)
+  ip=$(get_ip)
+  port=$(get_port)
+  echo -e "  ${BOLD}Panel Info${NC}"; hr
+  echo -e "  Link : ${GREEN}$(panel_url)${NC}"
+  echo -e "  IP   : ${CYAN}${ip}${NC}"
+  echo -e "  Port : ${CYAN}${port}${NC}"
+  if [[ -n "$cert" && -f "$cert" ]]; then
+    echo -e "  SSL  : ${GREEN}ON${NC}"
+    [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}${domain}${NC}"
+  elif [[ -n "$cert" ]]; then
+    echo -e "  SSL  : ${YELLOW}CONFIGURED (file missing)${NC}"
+    echo -e "  Path : ${cert}"
+  else
+    echo -e "  SSL  : ${YELLOW}OFF${NC}"
+  fi
+  hr
+}
 
----
+free_port_80(){
+  echo -e "  ${YELLOW}Freeing port 80...${NC}"
+  has_pg && pasarguard down 2>/dev/null || true
+  # stop common web servers
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  fuser -k 80/tcp 2>/dev/null || true
+  sleep 1
+  if ss -tlnp | grep -q ':80 '; then
+    echo -e "  ${RED}Port 80 still busy:${NC}"
+    ss -tlnp | grep ':80 '
+    return 1
+  fi
+  echo -e "  ${GREEN}Port 80 is free${NC}"
+  return 0
+}
 
-## 📋 Menu Overview
+list_certs(){
+  echo -e "  ${BOLD}Certificates${NC}"; hr
+  if [[ ! -d /etc/letsencrypt/live ]]; then
+    echo "  (none)"; return
+  fi
+  local d name exp status
+  for d in /etc/letsencrypt/live/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    [[ "$name" == "README" ]] && continue
+    [[ -f "${d}fullchain.pem" ]] || continue
+    exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
+    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then
+      status="${RED}EXPIRED${NC}"
+    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" 2>/dev/null; then
+      status="${YELLOW}Expires <30d${NC}"
+    else
+      status="${GREEN}Active${NC}"
+    fi
+    echo -e "  • ${CYAN}${name}${NC}  [${status}]"
+    echo -e "    Expiry : ${exp}"
+    echo -e "    Path   : ${d}fullchain.pem"
+  done
+  hr
+}
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v1.8.0                   │
-│          https://panel.example.com/dashboard/                │
-├──────────────────────────────────────────────────────────────┤
-│  0. Exit                                                     │
-│──────────────────────────────────────────────────────────────│
-│  1. Install / Update / Uninstall                             │
-│  2. Service Management          (Start / Stop / Restart...)  │
-│  3. Panel Settings              (Port / Path / Admin...)     │
-│  4. SSL Certificate Management                               │
-│  5. Backup & Restore                                         │
-│  6. Migrate to New Server                                    │
-│──────────────────────────────────────────────────────────────│
-│  7. Node Management                                          │
-│  8. Firewall & Security                                      │
-│  9. Database Management                                      │
-│──────────────────────────────────────────────────────────────│
-│ 10. Tools & Utilities                                        │
-│ 11. Quick Status                                             │
-└──────────────────────────────────────────────────────────────┘
-```
+# ─────────────────── 2 Service ───────────────────
+m_service(){
+  while true; do
+    header
+    echo -e "  ${BOLD}2. Service Management${NC}"; hr
+    echo "  1. Start"
+    echo "  2. Stop"
+    echo "  3. Restart"
+    echo "  4. Status"
+    echo "  5. Logs (live)"
+    echo "  6. Logs (last lines)"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pasarguard up; pause ;;
+      2) pasarguard down; pause ;;
+      3) pasarguard restart; pause ;;
+      4) pasarguard status; pause ;;
+      5) pasarguard logs ;;
+      6) pasarguard logs -n; pause ;;
+      0) break ;;
+    esac
+  done
+}
 
-Panel URL is shown at the top of the menu when installed.
+# ─────────────────── 1 Install ───────────────────
+m_install(){
+  while true; do
+    header
+    echo -e "  ${BOLD}1. Install / Update / Uninstall${NC}"; hr
+    echo "  1. Install TimescaleDB (recommended)"
+    echo "  2. Install PostgreSQL"
+    echo "  3. Install SQLite"
+    echo "  4. Install MySQL"
+    echo "  5. Install MariaDB"
+    echo "  6. Update panel"
+    echo "  7. Update to Pre-release / Dev"
+    echo "  8. Uninstall panel"
+    echo "  9. Reinstall CLI script"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database timescaledb; pause ;;
+      2) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database postgresql; pause ;;
+      3) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install; pause ;;
+      4) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mysql; pause ;;
+      5) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mariadb; pause ;;
+      6) pasarguard update; pause ;;
+      7) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --pre-release; pause ;;
+      8) read -rp "  Type yes to uninstall: " c; [[ "$c" == yes ]] && pasarguard uninstall; pause ;;
+      9) pasarguard install-script; pause ;;
+      0) break ;;
+    esac
+  done
+}
 
----
+# ─────────────────── 2 Port ───────────────────
+m_port(){
+  while true; do
+    header
+    echo -e "  ${BOLD}2. Port & Access${NC}"; hr
+    show_info
+    echo "  1. Change panel port"
+    echo "  2. Open firewall for panel port"
+    echo "  3. Sub link port help"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        echo "  Current: $(get_port) | Suggest: 8443 2083 2053 2087"
+        read -rp "  New port: " np
+        if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 && -f "$ENV_FILE" ]]; then
+          grep -q '^UVICORN_PORT=' "$ENV_FILE" && sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE" || echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
+          ufw allow "${np}/tcp" 2>/dev/null || true
+          pasarguard restart
+          show_info
+        fi
+        pause
+        ;;
+      2)
+        p=$(get_port)
+        ufw allow 80/tcp 2>/dev/null || true
+        ufw allow 443/tcp 2>/dev/null || true
+        ufw allow "${p}/tcp" 2>/dev/null || true
+        echo -e "  ${GREEN}Opened 80, 443, ${p}${NC}"
+        pause
+        ;;
+      3)
+        echo "  Sub URL port = panel port / domain in Settings > Subscriptions"
+        echo "  Hosts page = inbound address/port inside configs (not sub URL)"
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
 
-## ✨ Features
+# ─────────────────── 3 SSL ───────────────────
+# Panel container ONLY sees files under DATA_DIR (/var/lib/pasarguard).
+# Never point UVICORN_SSL_* at /etc/letsencrypt directly.
 
-| Category | Features |
-|----------|----------|
-| **Service** | Start • Stop • Restart • Status • Live Logs |
-| **Install** | TimescaleDB • PostgreSQL • SQLite • MySQL • MariaDB |
-| **Port** | Change port • Open firewall • Show access links |
-| **SSL** | Let's Encrypt (one domain) • Self-Signed • List & Expiry • Renew • Delete/Revoke • Apply to Panel • Full cert content view |
-| **Backup** | Manual backup • Telegram auto-backup • Restore • PostgreSQL dump |
-| **Migrate** | **Full automatic transfer to new VPS** (package + SCP + remote install + restore) |
-| **Settings** | Temp owner key • Edit `.env` / compose • DB password reset |
-| **Node** | Install node • Show API Key • Show certificates • Multi-name support |
-| **Security** | UFW • BBR • Fail2Ban • IP Limit (lock panel to your IP) |
-| **Tools** | Speedtest • Disk/Mem/Ports • Docker cleanup • Geo files • Who uses port 80 |
+copy_cert_to_panel(){
+  local domain="$1"
+  local src=""
+  # Prefer exact live dir; also accept first domain as folder name for multi-SAN certs
+  if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+    src="/etc/letsencrypt/live/${domain}"
+  else
+    # multi-domain certs live under the first -d name
+    for d in /etc/letsencrypt/live/*/; do
+      [[ -f "${d}fullchain.pem" ]] || continue
+      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}"; then
+        src="${d%/}"
+        break
+      fi
+    done
+  fi
+  [[ -n "$src" && -f "${src}/fullchain.pem" ]] || { echo -e "  ${RED}No LE cert covering ${domain}${NC}"; return 1; }
+  local dst="${DATA_DIR}/certs/${domain}"
+  mkdir -p "$dst"
+  cp -L "${src}/fullchain.pem" "${dst}/fullchain.pem"
+  cp -L "${src}/privkey.pem" "${dst}/privkey.pem"
+  chmod 644 "${dst}/fullchain.pem"
+  chmod 600 "${dst}/privkey.pem"
+  echo -e "  ${GREEN}Copied → ${dst}${NC} (from ${src})"
+}
 
----
+apply_cert_env(){
+  local domain="$1"
+  local dst="${DATA_DIR}/certs/${domain}"
+  [[ -f "${dst}/fullchain.pem" && -f "${dst}/privkey.pem" ]] || { echo -e "  ${RED}Missing files in ${dst}${NC}"; return 1; }
+  [[ -f "$ENV_FILE" ]] || { echo -e "  ${RED}No .env${NC}"; return 1; }
+  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_PORT=/d;/^UVICORN_SSL_CA_TYPE=/d' "$ENV_FILE"
+  {
+    echo "UVICORN_SSL_CERTFILE=${dst}/fullchain.pem"
+    echo "UVICORN_SSL_KEYFILE=${dst}/privkey.pem"
+    echo "UVICORN_PORT=443"
+  } >> "$ENV_FILE"
+  ufw allow 443/tcp 2>/dev/null || true
+  echo -e "  ${GREEN}.env → panel path + port 443${NC}"
+}
 
-## 🔐 SSL Certificate (Easy Mode)
+cert_covers_domain(){
+  local pem="$1" domain="$2"
+  [[ -f "$pem" ]] || return 1
+  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -qE "DNS:${domain}(,|$| )" && return 0
+  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}" && return 0
+  return 1
+}
 
-Exactly like 3X-UI experience:
+ssl_health(){
+  echo -e "  ${BOLD}SSL Health Check${NC}"; hr
+  echo -e "  ${CYAN}[.env]${NC}"
+  local cert key port
+  cert=$(get_env UVICORN_SSL_CERTFILE)
+  key=$(get_env UVICORN_SSL_KEYFILE)
+  port=$(get_port)
+  echo "  CERTFILE = ${cert:-<empty>}"
+  echo "  KEYFILE  = ${key:-<empty>}"
+  echo "  PORT     = ${port}"
+  if [[ -z "$cert" || -z "$key" ]]; then
+    echo -e "  ${RED}SSL not set in .env${NC}"
+  elif [[ "$cert" == /etc/letsencrypt/* ]]; then
+    echo -e "  ${RED}BAD: .env points to /etc/letsencrypt (container cannot read it)${NC}"
+  elif [[ -f "$cert" && -f "$key" ]]; then
+    echo -e "  ${GREEN}Files exist on host${NC}"
+    echo -n "  Expiry: "; openssl x509 -in "$cert" -noout -enddate 2>/dev/null || true
+    echo "  SANs:"
+    openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/    /' || true
+  else
+    echo -e "  ${RED}Cert/key path missing on host${NC}"
+  fi
+  hr
+  echo -e "  ${CYAN}[Let's Encrypt live]${NC}"
+  if [[ -d /etc/letsencrypt/live ]]; then
+    for d in /etc/letsencrypt/live/*/; do
+      n=$(basename "$d"); [[ "$n" == README ]] && continue
+      [[ -f "${d}fullchain.pem" ]] || continue
+      echo -n "  • $n  "
+      if openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then echo -e "${GREEN}valid${NC}"; else echo -e "${RED}expired${NC}"; fi
+      openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/      /'
+    done
+  else
+    echo "  (none)"
+  fi
+  hr
+  echo -e "  ${CYAN}[Panel data certs]${NC}"
+  ls -la "${DATA_DIR}/certs/" 2>/dev/null || echo "  (empty)"
+  hr
+  echo -e "  ${CYAN}[Listen + local HTTPS]${NC}"
+  ss -tlnp | grep -E ':443|:8000' || echo "  nothing on 443/8000"
+  curl -sI --max-time 5 -k "https://127.0.0.1/dashboard/" 2>/dev/null | head -2 || echo "  local HTTPS failed"
+  hr
+  echo -e "  ${CYAN}[SNI test panel vs subs]${NC}"
+  for host in panel.nexus-net.online subs.nexus-net.online; do
+    echo -n "  $host → "
+    echo | openssl s_client -connect 127.0.0.1:443 -servername "$host" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "fail"
+  done
+  hr
+}
 
-1. Choose **Issue Let's Encrypt**
-2. Enter your domain
-3. Script automatically:
-   - Frees port 80
-   - Issues certificate with Certbot
-   - Copies certs to panel-readable path
-   - Updates `.env`
-   - Restarts panel on port 443
+m_ssl(){
+  while true; do
+    header
+    echo -e "  ${BOLD}4. SSL Certificate Management${NC}"; hr
+    echo "  1. SSL health check / debug"
+    echo "  2. List Let's Encrypt certs"
+    echo "  3. Issue cert (domain) + apply"
+    echo "  4. Fix paths (copy LE → panel + .env)"
+    echo "  5. Renew all + re-copy to panel"
+    echo "  6. Delete / revoke certificate"
+    echo "  7. Self-signed certificate"
+    echo "  8. Show .env SSL lines"
+    echo "  9. Edit .env"
+    echo " 10. Restart panel"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) ssl_health; pause ;;
+      2) list_certs; pause ;;
+      3)
+        echo "  Examples:"
+        echo "    panel.example.com"
+        echo "    panel.example.com subs.example.com   (multi-domain / SAN)"
+        read -rp "  Domain(s): " domains
+        [[ -z "$domains" ]] && continue
+        primary=$(echo "$domains" | awk '{print $1}')
+        # If all domains already covered by one valid cert, only fix paths
+        all_ok=1
+        for host in $domains; do
+          found=0
+          for d in /etc/letsencrypt/live/*/; do
+            [[ -f "${d}fullchain.pem" ]] || continue
+            if cert_covers_domain "${d}fullchain.pem" "$host"; then found=1; break; fi
+          done
+          [[ $found -eq 1 ]] || all_ok=0
+        done
+        if [[ $all_ok -eq 1 ]]; then
+          echo -e "  ${GREEN}Valid cert already covers: ${domains}${NC}"
+          echo "  Skipping certbot. Fixing panel paths only..."
+          copy_cert_to_panel "$primary"
+          apply_cert_env "$primary"
+          # also copy under each name for clarity
+          for host in $domains; do copy_cert_to_panel "$host" 2>/dev/null || true; done
+          pasarguard restart
+          ssl_health
+          pause
+          continue
+        fi
+        apt install -y certbot >/dev/null 2>&1 || true
+        ufw allow 80/tcp 2>/dev/null || true
+        free_port_80 || { echo -e "  ${RED}Port 80 busy${NC}"; pause; continue; }
+        cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email)
+        for host in $domains; do cb+=(-d "$host"); done
+        "${cb[@]}" || certbot certonly --standalone $(for host in $domains; do echo -n " -d $host"; done)
+        has_pg && pasarguard up 2>/dev/null || true
+        if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]] || ls /etc/letsencrypt/live/*/fullchain.pem >/dev/null 2>&1; then
+          for host in $domains; do copy_cert_to_panel "$host" || true; done
+          apply_cert_env "$primary"
+          pasarguard restart
+          ssl_health
+        else
+          echo -e "  ${RED}certbot failed${NC}"
+          has_pg && pasarguard up 2>/dev/null || true
+        fi
+        pause
+        ;;
+      4)
+        read -rp "  Primary domain (used in .env, e.g. panel.nexus-net.online): " primary
+        [[ -z "$primary" ]] && continue
+        copy_cert_to_panel "$primary" && apply_cert_env "$primary"
+        read -rp "  Extra domain names to copy folders for (optional, space-separated): " extras
+        for host in $extras; do copy_cert_to_panel "$host" || true; done
+        pasarguard restart
+        ssl_health
+        pause
+        ;;
+      5)
+        certbot renew
+        for d in /etc/letsencrypt/live/*/; do
+          n=$(basename "$d"); [[ "$n" == README ]] && continue
+          copy_cert_to_panel "$n" || true
+        done
+        echo -e "  ${YELLOW}Restart panel to load renewed files?${NC}"
+        read -rp "  yes/no: " r
+        [[ "$r" == yes ]] && pasarguard restart
+        ssl_health
+        pause
+        ;;
+      6)
+        list_certs
+        read -rp "  Domain to delete: " domain
+        [[ -z "$domain" ]] && continue
+        read -rp "  Type yes: " c
+        if [[ "$c" == yes ]]; then
+          certbot revoke --cert-path "/etc/letsencrypt/live/${domain}/fullchain.pem" --non-interactive 2>/dev/null || true
+          certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || \
+            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
+          rm -rf "${DATA_DIR}/certs/${domain}" 2>/dev/null || true
+          echo -e "  ${GREEN}Removed ${domain}${NC}"
+        fi
+        pause
+        ;;
+      7)
+        read -rp "  CN: " cn
+        mkdir -p "${DATA_DIR}/certs"
+        openssl req -x509 -newkey rsa:4096 -keyout "${DATA_DIR}/certs/key.pem" \
+          -out "${DATA_DIR}/certs/cert.pem" -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
+        echo "  ${DATA_DIR}/certs/cert.pem"; pause
+        ;;
+      8) grep -E 'SSL|UVICORN|CERT|KEY|PORT' "$ENV_FILE" 2>/dev/null || echo none; pause ;;
+      9) pasarguard edit-env ;;
+      10) pasarguard restart; pause ;;
+      0) break ;;
+    esac
+  done
+}
 
-**View Existing Certificates** shows:
-- Domain name
-- Expiry status (Active / Expires soon / Expired)
-- Full path
-- Full certificate text + private key (on demand)
+# ─────────────────── 4 Backup ───────────────────
+m_backup(){
+  while true; do
+    header
+    echo -e "  ${BOLD}5. Backup & Restore${NC}"; hr
+    echo "  1. Manual backup"
+    echo "  2. Telegram auto-backup"
+    echo "  3. Restore"
+    echo "  4. List files"
+    echo "  5. Paths"
+    echo "  6. PostgreSQL dump"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pasarguard backup; pause ;;
+      2) pasarguard backup-service; pause ;;
+      3) pasarguard restore; pause ;;
+      4) ls -lh "$BACKUP_DIR" 2>/dev/null || echo "  empty"; pause ;;
+      5) echo "  $BACKUP_DIR"; echo "  $APP_DIR"; echo "  $DATA_DIR"; pause ;;
+      6)
+        OUT=~/pg-$(date +%F-%H%M).dump
+        C=$(docker ps -qf name=postgresql | head -1)
+        if [[ -n "$C" ]]; then
+          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
+          docker cp "$C":/tmp/pg.dump "$OUT"
+          echo -e "  ${GREEN}$OUT${NC}"
+        else echo "  no container"; fi
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
 
----
+# ─────────────────── 5 Migrate ───────────────────
+m_migrate(){
+  while true; do
+    header
+    echo -e "  ${BOLD}6. Migrate to New Server${NC}"; hr
+    echo "  1. Create migration package only"
+    echo "  2. Full Auto Transfer (package + upload + remote install + restore)"
+    echo "  3. Help / How it works"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        header
+        echo -e "  ${BOLD}Creating migration package...${NC}"; hr
+        DIR=~/pg-migrate-$(date +%F-%H%M)
+        mkdir -p "$DIR"
+        echo -e "  ${CYAN}→ Running official backup...${NC}"
+        pasarguard backup 2>/dev/null || true
+        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
+        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
+        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
+        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
+        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
+        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
+        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
+        rm -rf "$DIR"
+        echo -e "  ${GREEN}Package created:${NC}"
+        echo -e "  ${CYAN}$ARC${NC}"
+        ls -lh "$ARC" 2>/dev/null || true
+        echo
+        echo "  Next steps on new server:"
+        echo "  1. Upload this file"
+        echo "  2. Install panel + pg-m"
+        echo "  3. Extract and restore"
+        pause
+        ;;
+      2)
+        header
+        echo -e "  ${BOLD}Full Auto Transfer to New VPS${NC}"; hr
+        echo -e "  ${YELLOW}This will:${NC}"
+        echo "  • Create full migration package"
+        echo "  • Upload it to the new server via SSH/SCP"
+        echo "  • Install pg-m on the new server"
+        echo "  • Install PasarGuard panel (if missing)"
+        echo "  • Restore backup + apply certs + restart"
+        echo
+        read -rp "  New server IP: " NEW_IP
+        [[ -z "$NEW_IP" ]] && { echo -e "  ${RED}IP required${NC}"; pause; continue; }
+        read -rp "  SSH Port [22]: " NEW_PORT
+        NEW_PORT=${NEW_PORT:-22}
+        read -rp "  SSH User [root]: " NEW_USER
+        NEW_USER=${NEW_USER:-root}
+        echo
+        echo -e "  ${CYAN}Authentication method:${NC}"
+        echo "  1. Password"
+        echo "  2. SSH Key (path to private key)"
+        read -rp "  Select [1]: " AUTH_METHOD
+        AUTH_METHOD=${AUTH_METHOD:-1}
 
-## 🚚 Migrate to New Server (Full Auto)
+        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $NEW_PORT"
+        SCP_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -P $NEW_PORT"
 
-This is the upgraded migration system:
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          read -rp "  Path to private key: " KEY_PATH
+          [[ ! -f "$KEY_PATH" ]] && { echo -e "  ${RED}Key not found${NC}"; pause; continue; }
+          SSH_OPTS="$SSH_OPTS -i $KEY_PATH"
+          SCP_OPTS="$SCP_OPTS -i $KEY_PATH"
+        else
+          if ! command -v sshpass &>/dev/null; then
+            echo -e "  ${YELLOW}Installing sshpass...${NC}"
+            apt-get update -qq && apt-get install -y -qq sshpass >/dev/null 2>&1 || {
+              echo -e "  ${RED}Could not install sshpass. Use SSH key method instead.${NC}"
+              pause; continue
+            }
+          fi
+          read -rsp "  Root password: " NEW_PASS
+          echo
+          export SSHPASS="$NEW_PASS"
+        fi
 
-### What it does automatically:
+        echo -e "  ${CYAN}→ Testing SSH connection...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          if ! ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
+            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
+          fi
+        else
+          if ! sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
+            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
+          fi
+        fi
+        echo -e "  ${GREEN}Connected successfully${NC}"
 
-1. Creates a complete migration package on the old server  
-   (backup + `.env` + certificates + letsencrypt)
-2. Connects to the new VPS via SSH
-3. Uploads the package
-4. Installs `pg-m` on the new server
-5. Installs PasarGuard panel (if not present)
-6. Restores the backup
-7. Applies certificates and environment
-8. Restarts services
+        echo -e "  ${CYAN}→ Creating migration package...${NC}"
+        DIR=~/pg-migrate-$(date +%F-%H%M)
+        mkdir -p "$DIR"
+        pasarguard backup 2>/dev/null || true
+        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
+        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
+        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
+        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
+        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
+        DB_TYPE=$(get_env DATABASE_TYPE 2>/dev/null || echo "timescaledb")
+        echo "$DB_TYPE" > "$DIR/db_type.txt"
+        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
+        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
+        rm -rf "$DIR"
+        echo -e "  ${GREEN}Package ready: $(basename "$ARC")${NC}"
 
-You only need to provide:
-- New server IP
-- SSH port (default 22)
-- Root password or SSH key
+        echo -e "  ${CYAN}→ Uploading package to new server...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
+            echo -e "  ${RED}Upload failed${NC}"; pause; continue
+          }
+        else
+          sshpass -e scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
+            echo -e "  ${RED}Upload failed${NC}"; pause; continue
+          }
+        fi
+        echo -e "  ${GREEN}Upload complete${NC}"
 
----
+        REMOTE_SCRIPT='#!/bin/bash
+set -e
+ARC=$(ls -1t /root/pg-migrate-*.tar.gz 2>/dev/null | head -1)
+if [[ -z "$ARC" ]]; then
+  echo "ERROR: No migration package found in /root"
+  exit 1
+fi
+echo "→ Found package: $ARC"
+cd /root
+tar -xzf "$ARC"
+MIG_DIR=$(ls -d pg-migrate-* | head -1)
+echo "→ Extracted to $MIG_DIR"
 
-## 📦 Manual Install
+if [[ -f "$MIG_DIR/pg-m" ]]; then
+  cp "$MIG_DIR/pg-m" /usr/local/bin/pg-m
+  chmod +x /usr/local/bin/pg-m
+  echo "→ pg-m installed"
+fi
 
-```bash
-curl -fsSL -o /usr/local/bin/pg-m \
-  https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/pg-m
-chmod +x /usr/local/bin/pg-m
-pg-m
-```
+# Clean conflicting old data if present
+if [[ -d /var/lib/postgresql/pasarguard ]] || docker volume ls 2>/dev/null | grep -qi pasarguard; then
+  echo "→ Cleaning previous PasarGuard data to avoid conflicts..."
+  command -v pasarguard >/dev/null && pasarguard down 2>/dev/null || true
+  docker rm -f $(docker ps -aq --filter name=pasarguard) 2>/dev/null || true
+  docker rm -f $(docker ps -aq --filter name=timescale) 2>/dev/null || true
+  docker volume rm $(docker volume ls -q | grep -i pasarguard) 2>/dev/null || true
+  rm -rf /var/lib/postgresql/pasarguard /opt/pasarguard /var/lib/pasarguard 2>/dev/null || true
+fi
 
----
+if ! command -v pasarguard &>/dev/null; then
+  echo "→ Installing PasarGuard panel..."
+  DB_TYPE=$(cat "$MIG_DIR/db_type.txt" 2>/dev/null || echo "timescaledb")
+  case "$DB_TYPE" in
+    mysql|mariadb|postgresql|sqlite) ;;
+    *) DB_TYPE="timescaledb" ;;
+  esac
+  bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database "$DB_TYPE" --no-ssl || true
+fi
 
-## 🗑️ Uninstall Manager Only
+# Restore certs BEFORE applying .env so paths exist
+if [[ -d "$MIG_DIR/certs" ]]; then
+  mkdir -p /var/lib/pasarguard
+  cp -a "$MIG_DIR/certs" /var/lib/pasarguard/
+  echo "→ Panel certs restored"
+fi
+if [[ -d "$MIG_DIR/letsencrypt" ]]; then
+  cp -a "$MIG_DIR/letsencrypt" /etc/
+  echo "→ Let'\''s Encrypt certs restored"
+  # Also copy LE live certs into panel-readable path
+  for d in /etc/letsencrypt/live/*/; do
+    [[ -d "$d" ]] || continue
+    name=$(basename "$d")
+    [[ "$name" == "README" ]] && continue
+    mkdir -p "/var/lib/pasarguard/certs/${name}"
+    cp -L "${d}fullchain.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
+    cp -L "${d}privkey.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
+  done
+  echo "→ LE certs copied to panel path"
+fi
 
-```bash
-rm -f /usr/local/bin/pg-m
-```
+# Restore .env but force safe SSL settings until certs verified
+if [[ -f "$MIG_DIR/env.backup" ]]; then
+  mkdir -p /opt/pasarguard
+  cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
+  # If cert files missing, disable SSL so panel can start
+  CERT=$(grep -E "^UVICORN_SSL_CERTFILE=" /opt/pasarguard/.env 2>/dev/null | cut -d= -f2- | sed s/\"//g || true)
+  if [[ -n "$CERT" && ! -f "$CERT" ]]; then
+    echo "→ SSL cert path missing — disabling SSL temporarily so panel starts"
+    sed -i "s|^UVICORN_SSL_CERTFILE=|#UVICORN_SSL_CERTFILE=|" /opt/pasarguard/.env
+    sed -i "s|^UVICORN_SSL_KEYFILE=|#UVICORN_SSL_KEYFILE=|" /opt/pasarguard/.env
+    if grep -q "^UVICORN_PORT=" /opt/pasarguard/.env; then
+      sed -i "s|^UVICORN_PORT=.*|UVICORN_PORT=8000|" /opt/pasarguard/.env
+    else
+      echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
+    fi
+  fi
+  echo "→ .env restored"
+fi
 
-This does **not** remove your PasarGuard panel or data.
+if command -v pasarguard &>/dev/null; then
+  mkdir -p /opt/pasarguard/backup
+  cp -a "$MIG_DIR"/* /opt/pasarguard/backup/ 2>/dev/null || true
+  # Non-interactive restore attempt: pick first zip if present
+  ZIP=$(ls -1t /opt/pasarguard/backup/backup_*.zip 2>/dev/null | head -1)
+  if [[ -n "$ZIP" ]]; then
+    echo "→ Attempting restore from $ZIP"
+    # official restore is interactive; copy note for user
+    echo "→ After login run: pasarguard restore"
+  fi
+fi
 
----
+if command -v pasarguard &>/dev/null; then
+  pasarguard restart || true
+  echo "→ Panel restarted"
+fi
 
-## 📌 Requirements
+echo ""
+echo "════════════════════════════════════════"
+echo "  Migration finished on this server"
+echo "  1) Run:  pg-m"
+echo "  2) If data missing: pasarguard restore"
+echo "  3) Re-issue SSL after DNS points here"
+echo "════════════════════════════════════════"
+'
 
-- Debian / Ubuntu (recommended)
-- Root access
-- Docker (installed automatically by official PasarGuard scripts if missing)
+        echo -e "  ${CYAN}→ Running remote installation & restore...${NC}"
+        if [[ "$AUTH_METHOD" == "2" ]]; then
+          ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
+        else
+          sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
+        fi
 
----
+        echo
+        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
+        echo -e "  ${GREEN}  Full transfer completed!${NC}"
+        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
+        echo
+        echo -e "  New server: ${CYAN}${NEW_IP}${NC}"
+        echo -e "  Login and run:  ${CYAN}pg-m${NC}"
+        echo
+        pause
+        ;;
+      3)
+        header
+        echo -e "  ${BOLD}How Full Auto Transfer works${NC}"; hr
+        echo "  1. Creates a complete package on current server"
+        echo "     (official backup + .env + certs + letsencrypt + pg-m)"
+        echo "  2. Connects to new VPS via SSH (password or key)"
+        echo "  3. Uploads the package"
+        echo "  4. On new server automatically:"
+        echo "     • Installs pg-m"
+        echo "     • Installs PasarGuard panel (same DB type)"
+        echo "     • Restores backup"
+        echo "     • Applies .env and certificates"
+        echo "     • Restarts services"
+        echo
+        echo "  Requirements on new server:"
+        echo "  • Fresh Ubuntu/Debian preferred"
+        echo "  • Root SSH access"
+        echo "  • Ports 22, 80, 443 open"
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
 
-## 🤝 Credits
+# ─────────────────── 3 Panel Settings ───────────────────
+m_settings(){
+  while true; do
+    header
+    echo -e "  ${BOLD}3. Panel Settings${NC}"; hr
+    show_info
+    echo "  1. Change panel port"
+    echo "  2. Open firewall for panel port"
+    echo "  3. Temp key (owner reset)"
+    echo "  4. Show access links"
+    echo "  5. View .env"
+    echo "  6. Edit .env"
+    echo "  7. Edit docker-compose"
+    echo "  8. Versions"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        read -rp "  New port: " np
+        if [[ "$np" =~ ^[0-9]+$ ]]; then
+          if grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
+            sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE"
+          else
+            echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
+          fi
+          echo -e "  ${GREEN}Port set to ${np}${NC}"
+          echo "  Restart panel to apply"
+        fi
+        pause
+        ;;
+      2)
+        p=$(get_port)
+        ufw allow "${p}/tcp" 2>/dev/null || true
+        echo -e "  ${GREEN}Opened port ${p}${NC}"
+        pause
+        ;;
+      3) pasarguard cli generate-temp-key; pause ;;
+      4) show_info; pause ;;
+      5) cat "$ENV_FILE" 2>/dev/null || echo missing; pause ;;
+      6) pasarguard edit-env ;;
+      7) pasarguard edit ;;
+      8) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -i pasarguard || true; pause ;;
+      0) break ;;
+    esac
+  done
+}
 
-- Built for the [PasarGuard](https://github.com/PasarGuard) community
-- Inspired by the classic `x-ui` management experience
-- Uses official `pasarguard` and `pg-node` commands under the hood
+# ─────────────────── 9 Database ───────────────────
+m_database(){
+  while true; do
+    header
+    echo -e "  ${BOLD}9. Database Management${NC}"; hr
+    echo "  1. Show DB URL / type"
+    echo "  2. Reset PostgreSQL password"
+    echo "  3. PostgreSQL dump"
+    echo "  4. List Docker DB containers"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        grep -iE 'SQLALCHEMY_DATABASE_URL|DATABASE|DB_' "$ENV_FILE" 2>/dev/null || echo "  no env"
+        pause
+        ;;
+      2)
+        read -rp "  New password: " npw
+        C=$(docker ps -qf name=postgresql | head -1)
+        if [[ -n "$C" && -n "$npw" ]]; then
+          docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" && echo -e "  ${GREEN}OK${NC}"
+        else
+          echo "  No PostgreSQL container or empty password"
+        fi
+        pause
+        ;;
+      3)
+        OUT=~/pg-$(date +%F-%H%M).dump
+        C=$(docker ps -qf name=postgresql | head -1)
+        if [[ -n "$C" ]]; then
+          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
+          docker cp "$C":/tmp/pg.dump "$OUT"
+          echo -e "  ${GREEN}$OUT${NC}"
+        else
+          echo "  no PostgreSQL container"
+        fi
+        pause
+        ;;
+      4)
+        docker ps -a --filter name=postgres --filter name=mysql --filter name=mariadb --filter name=timescale
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
 
----
+# ─────────────────── 7 Node ───────────────────
+m_node(){
+  while true; do
+    header
+    echo -e "  ${BOLD}7. Node Management${NC}"; hr
+    echo "  1. Install node"
+    echo "  2. Install custom name"
+    echo "  3. Show API Key"
+    echo "  4. Show Certificate"
+    echo "  5. Show .env"
+    echo "  6. Edit .env"
+    echo "  7. Help / status"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install; pause ;;
+      2) read -rp "  Name: " n; [[ -n "$n" ]] && bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install --name "$n"; pause ;;
+      3)
+        for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do
+          [[ -f "$f" ]] && { echo -e "  ${GREEN}$f${NC}"; grep -i API_KEY "$f" || true; }
+        done; pause
+        ;;
+      4)
+        for f in /var/lib/pg-node/certs/ssl_cert.pem /opt/pg-node/certs/ssl_cert.pem; do
+          [[ -f "$f" ]] && { echo "$f"; cat "$f"; }
+        done
+        find /var/lib /opt -name ssl_cert.pem 2>/dev/null | head -5
+        pause
+        ;;
+      5) for f in /opt/pg-node/.env /var/lib/pg-node/.env; do [[ -f "$f" ]] && cat "$f"; done; pause ;;
+      6)
+        if [[ -f /opt/pg-node/.env ]]; then nano /opt/pg-node/.env
+        elif [[ -f /var/lib/pg-node/.env ]]; then nano /var/lib/pg-node/.env
+        else read -rp "  Path: " p; [[ -f "$p" ]] && nano "$p"; fi
+        ;;
+      7) command -v pg-node >/dev/null && { pg-node --help; pg-node status; } || echo "  not installed"; pause ;;
+      0) break ;;
+    esac
+  done
+}
 
-## 📄 License
+# ─────────────────── 8 Firewall + IP Limit ───────────────────
+m_firewall(){
+  while true; do
+    header
+    echo -e "  ${BOLD}8. Firewall & Security${NC}"; hr
+    echo "  1. Install + enable UFW"
+    echo "  2. Allow SSH 22"
+    echo "  3. Allow panel port"
+    echo "  4. Allow 80 / 443"
+    echo "  5. Allow custom port"
+    echo "  6. UFW status"
+    echo "  7. Enable BBR"
+    echo "  8. Install Fail2Ban"
+    echo "  9. IP Limit - allow only my IP to panel"
+    echo " 10. IP Limit - add allowed IP"
+    echo " 11. IP Limit - list / reset panel rules"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        apt install -y ufw >/dev/null 2>&1
+        ufw default deny incoming; ufw default allow outgoing
+        ufw allow 22/tcp; ufw --force enable
+        echo -e "  ${GREEN}UFW enabled${NC}"; pause
+        ;;
+      2) ufw allow 22/tcp; echo OK; pause ;;
+      3) p=$(get_port); ufw allow "${p}/tcp"; echo "  $p OK"; pause ;;
+      4) ufw allow 80/tcp; ufw allow 443/tcp; echo OK; pause ;;
+      5) read -rp "  Port: " p; [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "${p}/tcp"; pause ;;
+      6) ufw status verbose; pause ;;
+      7)
+        grep -q bbr /etc/sysctl.conf 2>/dev/null || {
+          echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        }
+        sysctl -p >/dev/null; sysctl net.ipv4.tcp_congestion_control; pause
+        ;;
+      8)
+        apt install -y fail2ban >/dev/null 2>&1
+        systemctl enable --now fail2ban
+        echo -e "  ${GREEN}Fail2Ban on${NC}"; pause
+        ;;
+      9)
+        # Restrict panel port to current SSH client IP
+        p=$(get_port)
+        myip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+        [[ -z "$myip" ]] && myip=$(get_ip)
+        echo -e "  Panel port: ${CYAN}${p}${NC}"
+        echo -e "  Your IP   : ${CYAN}${myip}${NC}"
+        read -rp "  Lock panel port to this IP only? (yes/no): " c
+        if [[ "$c" == yes ]]; then
+          # delete open allow for port then allow from IP
+          ufw delete allow "${p}/tcp" 2>/dev/null || true
+          ufw allow from "$myip" to any port "$p" proto tcp
+          ufw reload
+          echo -e "  ${GREEN}Panel port ${p} only from ${myip}${NC}"
+          echo -e "  ${YELLOW}Warning: other IPs cannot open panel${NC}"
+        fi
+        pause
+        ;;
+      10)
+        p=$(get_port)
+        read -rp "  IP to allow for panel port ${p}: " ip
+        if [[ -n "$ip" ]]; then
+          ufw allow from "$ip" to any port "$p" proto tcp
+          ufw reload
+          echo -e "  ${GREEN}Allowed ${ip} -> ${p}${NC}"
+        fi
+        pause
+        ;;
+      11)
+        p=$(get_port)
+        echo -e "  Rules related to port ${p}:"
+        ufw status numbered | grep -E "${p}|Status" || ufw status
+        echo
+        read -rp "  Reset: open panel port ${p} to world? (yes/no): " c
+        if [[ "$c" == yes ]]; then
+          # remove from-ip rules is hard; open general allow
+          ufw allow "${p}/tcp"
+          ufw reload
+          echo -e "  ${GREEN}Port ${p} open to all${NC}"
+        fi
+        pause
+        ;;
+      0) break ;;
+    esac
+  done
+}
 
-MIT License — free for personal and commercial use.
+# ─────────────────── 10 Tools ───────────────────
+m_tools(){
+  while true; do
+    header
+    echo -e "  ${BOLD}10. Tools & Utilities${NC}"; hr
+    echo "  1. Speedtest"
+    echo "  2. Disk usage"
+    echo "  3. Memory"
+    echo "  4. Listening ports"
+    echo "  5. Restart Docker"
+    echo "  6. Docker prune"
+    echo "  7. Update Geo files"
+    echo "  8. System info"
+    echo "  9. Panel link"
+    echo " 10. Who uses port 80"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) command -v speedtest-cli >/dev/null || apt install -y speedtest-cli 2>/dev/null || true
+         speedtest-cli --simple 2>/dev/null || echo n/a; pause ;;
+      2) df -h; pause ;;
+      3) free -h; pause ;;
+      4) ss -tlnp; pause ;;
+      5) systemctl restart docker; echo OK; pause ;;
+      6) docker system prune -f; echo OK; pause ;;
+      7)
+        mkdir -p /usr/local/share/xray
+        curl -fsSL -o /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>/dev/null
+        curl -fsSL -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat 2>/dev/null
+        echo OK; pause
+        ;;
+      8)
+        echo "  Host $(hostname) | $(nproc) CPU"
+        grep PRETTY /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'
+        free -h | grep Mem; df -h / | tail -1; pause
+        ;;
+      9) show_info; pause ;;
+      10) ss -tlnp | grep ':80 ' || echo "  port 80 free"; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ─────────────────── Main ───────────────────
+main(){
+  while true; do
+    header
+    if has_pg && [[ -f "$ENV_FILE" ]]; then
+      echo -e "  ${GREEN}$(panel_url)${NC}"
+      hr
+    fi
+    echo -e "  ${BOLD}Core${NC}"
+    echo "   1) Install / Update / Uninstall"
+    echo "   2) Service Management"
+    echo "   3) Panel Settings"
+    echo "   4) SSL Certificate"
+    echo "   5) Backup & Restore"
+    echo "   6) Migrate to New Server"
+    echo
+    echo -e "  ${BOLD}Infra${NC}"
+    echo "   7) Node Management"
+    echo "   8) Firewall & Security"
+    echo "   9) Database Management"
+    echo
+    echo -e "  ${BOLD}System${NC}"
+    echo "  10) Tools & Utilities"
+    echo "  11) Quick Status"
+    echo "   0) Exit"
+    hr
+    read -rp "  Select [0-11]: " c
+    case $c in
+      0) echo "  Bye"; exit 0 ;;
+      1) m_install ;;
+      2) m_service ;;
+      3) m_settings ;;
+      4) m_ssl ;;
+      5) m_backup ;;
+      6) m_migrate ;;
+      7) m_node ;;
+      8) m_firewall ;;
+      9) m_database ;;
+      10) m_tools ;;
+      11)
+        header
+        echo -e "  ${BOLD}Quick Status${NC}"; hr
+        # Fast local status only (no external curl timeouts)
+        if has_pg; then
+          docker ps --format "table {{.Names}}\t{{.Status}}" 2>/dev/null | grep -E "pasarguard|timescale|pgbouncer|pgadmin|NAMES" || true
+        else
+          echo "  Panel not installed"
+        fi
+        echo
+        show_info
+        echo -e "  Disk : $(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+        echo -e "  Mem  : $(free -h 2>/dev/null | awk '/Mem:/{print $3"/"$2}')"
+        pause
+        ;;
+    esac
+  done
+}
+
+need_root
+main
