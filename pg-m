@@ -1,82 +1,207 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v1.10.0
-#  3x-ui style terminal management menu for PasarGuard
+#  PasarGuard Manager (pg-m)  v2.0.0
+#  x-ui style management menu for PasarGuard
+#  Full backup / restore / one-command server migration
 # ═══════════════════════════════════════════════════════════════
-set -euo pipefail
+set -o pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
-DIM='\033[2m'
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'; BOLD=$'\033[1m'
+DIM=$'\033[2m'
+
+SCRIPT_VERSION="2.0.0"
+SOURCE_URL="https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/pg-m"
+OFFICIAL_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh"
+OFFICIAL_NODE_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
 
 APP_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 ENV_FILE="${APP_DIR}/.env"
-BACKUP_DIR="${APP_DIR}/backup"
+BACKUP_DIR="${APP_DIR}/backup"            # official panel backups
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
-SCRIPT_VERSION="1.11.1"
 
-hr()  { echo -e "${CYAN}  ────────────────────────────────────────────────${NC}"; }
-pause(){ echo; read -rp "  Press Enter to continue..."; }
+PGM_DIR="/etc/pg-m"
+PGM_CONF="${PGM_DIR}/pg-m.conf"
+LOCAL_BACKUP_DIR="/root/pg-m-backups"     # pg-m full backups / migration packages
+LOG_FILE="/var/log/pg-m.log"
+INSTALL_PATH="/usr/local/bin/pg-m"
+
+AUTO=0                                    # 1 = non-interactive (cron / remote restore)
+
+# ─── Tiny UI helpers ─────────────────────────────────────────
+hr()   { echo -e "${CYAN}  ────────────────────────────────────────────────${NC}"; }
+ok()   { echo -e "  ${GREEN}✔ $*${NC}"; }
+warn() { echo -e "  ${YELLOW}⚠ $*${NC}"; }
+err()  { echo -e "  ${RED}✘ $*${NC}"; }
+info() { echo -e "  ${CYAN}→ $*${NC}"; }
+log()  { mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null; echo "[$(date '+%F %T')] $*" >>"$LOG_FILE" 2>/dev/null || true; }
+pause(){ [[ $AUTO -eq 1 ]] && return 0; echo; read -rp "  Press Enter to continue..." _; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo -e "${RED}  Please run as root${NC}"; exit 1; }; }
 has_pg(){ command -v pasarguard &>/dev/null; }
+has_cmd(){ command -v "$1" &>/dev/null; }
 
-# Fix wrong PGDATA / volume mount (common after migration)
+ask(){  # ask "Prompt" VARNAME [default]
+  local v d="${3:-}"
+  if [[ -n "$d" ]]; then read -rp "  $1 [$d]: " v; v="${v:-$d}"; else read -rp "  $1: " v; fi
+  printf -v "$2" '%s' "$v"
+}
+confirm(){  # confirm "Question" [y|n default]
+  local d="${2:-n}" a hint="[y/N]"
+  [[ "$d" == y ]] && hint="[Y/n]"
+  [[ $AUTO -eq 1 ]] && return 0
+  read -rp "  $1 $hint: " a
+  a="${a:-$d}"; [[ "$a" =~ ^[Yy] ]]
+}
+confirm_yes(){  # must type "yes"
+  [[ $AUTO -eq 1 ]] && return 0
+  local a; read -rp "  $1 (type yes): " a; [[ "$a" == yes ]]
+}
+run_interruptible(){ trap 'true' INT; "$@"; trap - INT; }
+human(){ numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+
+# ─── pg-m own config (/etc/pg-m/pg-m.conf, chmod 600) ────────
+conf_get(){ [[ -f "$PGM_CONF" ]] && grep -E "^$1=" "$PGM_CONF" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//'; return 0; }
+conf_set(){
+  mkdir -p "$PGM_DIR"; touch "$PGM_CONF"; chmod 600 "$PGM_CONF"
+  sed -i "/^$1=/d" "$PGM_CONF"; echo "$1=\"$2\"" >> "$PGM_CONF"
+}
+conf_del(){ [[ -f "$PGM_CONF" ]] && sed -i "/^$1=/d" "$PGM_CONF"; return 0; }
+
+# ─── docker / compose helpers ────────────────────────────────
+ensure_docker(){
+  if ! has_cmd docker; then
+    info "Docker not found — installing (get.docker.com)..."
+    has_cmd curl || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1; }
+    curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || { err "Docker install failed"; return 1; }
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  if ! docker compose version &>/dev/null && ! has_cmd docker-compose; then
+    apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
+  fi
+  docker info &>/dev/null || { err "Docker daemon is not running"; return 1; }
+  return 0
+}
+dc(){
+  if docker compose version &>/dev/null; then
+    docker compose --project-directory "$APP_DIR" -f "$COMPOSE_FILE" "$@"
+  elif has_cmd docker-compose; then
+    docker-compose --project-directory "$APP_DIR" -f "$COMPOSE_FILE" "$@"
+  else
+    return 127
+  fi
+}
+app_svc(){
+  local s; s=$(dc config --services 2>/dev/null)
+  if grep -qx pasarguard <<<"$s"; then echo pasarguard
+  else grep -ivE 'timescale|postgres|mysql|maria|bouncer|admin|^db$' <<<"$s" | head -1; fi
+}
+db_service(){
+  local s svcs; svcs=$(dc config --services 2>/dev/null)
+  for s in timescaledb postgresql postgres mysql mariadb db; do
+    grep -qx "$s" <<<"$svcs" && { echo "$s"; return; }
+  done
+  grep -iE 'timescale|postgres|mysql|maria' <<<"$svcs" | grep -ivE 'bouncer|admin' | head -1
+}
+
+# Fix wrong PGDATA / volume mount (common after manual migration)
 fix_compose_volumes(){
-  local compose="${COMPOSE_FILE:-/opt/pasarguard/docker-compose.yml}"
+  local compose="${COMPOSE_FILE}"
   [[ -f "$compose" ]] || return 0
   local changed=0
   if grep -qE '/var/lib/postgresql/pasarguard:/var/lib/postgresql["[:space:]]*$' "$compose" 2>/dev/null; then
-    sed -i 's|/var/lib/postgresql/pasarguard:/var/lib/postgresql|/var/lib/postgresql/pasarguard:/var/lib/postgresql/data|g' "$compose"
-    changed=1
+    sed -i 's|/var/lib/postgresql/pasarguard:/var/lib/postgresql\(["[:space:]]*\)$|/var/lib/postgresql/pasarguard:/var/lib/postgresql/data\1|' "$compose"; changed=1
   fi
-  if grep -qE 'PGDATA:[[:space:]]*/var/lib/postgresql$' "$compose" 2>/dev/null; then
-    sed -i 's|PGDATA:[[:space:]]*/var/lib/postgresql|PGDATA: /var/lib/postgresql/data|g' "$compose"
-    changed=1
+  if grep -qE 'PGDATA:[[:space:]]*/var/lib/postgresql[[:space:]]*$' "$compose" 2>/dev/null; then
+    sed -i 's|PGDATA:[[:space:]]*/var/lib/postgresql[[:space:]]*$|PGDATA: /var/lib/postgresql/data|' "$compose"; changed=1
   fi
-  [[ $changed -eq 1 ]] && echo -e "  ${GREEN}→ Fixed PostgreSQL volume mount in compose${NC}"
+  [[ $changed -eq 1 ]] && ok "Fixed PostgreSQL volume mount in compose"
   return 0
 }
 
-# Check if a TCP port is already in use
-port_in_use(){
-  local port="$1"
-  ss -tlnp 2>/dev/null | grep -qE ":${port}[[:space:]]" && return 0
-  return 1
-}
+port_in_use(){ ss -tlnp 2>/dev/null | grep -qE ":${1}[[:space:]]"; }
 
-# Safe restart with compose fix
 pg_restart(){
   fix_compose_volumes
   if has_pg; then
-    echo -e "  ${CYAN}→ Restarting panel...${NC}"
-    pasarguard restart 2>/dev/null || pasarguard up 2>/dev/null || true
+    info "Restarting panel..."
+    pasarguard restart 2>/dev/null || pasarguard up 2>/dev/null || dc up -d 2>/dev/null || true
     sleep 2
   fi
 }
 
-# ─── Status helpers ───────────────────────────────────────────
-_svc_status(){
-  # returns colored short status of key containers
-  local st=""
-  if docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -qiE 'pasarguard-pasarguard.*Up'; then
-    st="${GREEN}Panel:UP${NC}"
-  else
-    st="${RED}Panel:DOWN${NC}"
-  fi
-  if docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -qiE '(postgresql|timescale).*Up'; then
-    st="$st  ${GREEN}DB:UP${NC}"
-  else
-    st="$st  ${RED}DB:DOWN${NC}"
-  fi
-  echo -e "$st"
+# ─── .env / panel info ───────────────────────────────────────
+get_env(){
+  local k="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' \
+    | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' -e 's/[[:space:]]*$//'
+}
+set_env(){   # set_env KEY VALUE  (in panel .env)
+  [[ -f "$ENV_FILE" ]] || return 1
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
 
+_CACHED_IP=""
+get_ip(){   # public IPv4 (cached); falls back to local address
+  [[ -n "$_CACHED_IP" ]] && { echo "$_CACHED_IP"; return; }
+  local cache=/var/tmp/.pgm_ip
+  if [[ -f "$cache" && $(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt 600 ]]; then
+    _CACHED_IP=$(cat "$cache")
+  fi
+  if [[ -z "$_CACHED_IP" ]]; then
+    _CACHED_IP=$(curl -s4 --max-time 3 api.ipify.org 2>/dev/null || curl -s4 --max-time 3 ifconfig.me 2>/dev/null || true)
+    [[ "$_CACHED_IP" =~ ^[0-9.]+$ ]] || _CACHED_IP=""
+    [[ -n "$_CACHED_IP" ]] && echo "$_CACHED_IP" > "$cache"
+  fi
+  [[ -z "$_CACHED_IP" ]] && _CACHED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -z "$_CACHED_IP" ]] && _CACHED_IP="unknown"
+  echo "$_CACHED_IP"
+}
+get_port(){ local p; p=$(get_env UVICORN_PORT); echo "${p:-8000}"; }
+ssh_port(){
+  local p
+  p=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]; exit}')
+  [[ -z "$p" ]] && p=$(awk '/^Port[[:space:]]/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+  echo "${p:-22}"
+}
+get_domain_from_cert(){
+  local cert domain; cert=$(get_env UVICORN_SSL_CERTFILE)
+  [[ -z "$cert" ]] && return
+  if grep -qE 'certs/[^/]+/' <<<"$cert"; then domain=$(sed -n 's|.*/certs/\([^/]*\)/.*|\1|p' <<<"$cert")
+  elif grep -q 'letsencrypt/live/' <<<"$cert"; then domain=$(sed -n 's|.*/live/\([^/]*\)/.*|\1|p' <<<"$cert"); fi
+  echo "$domain"
+}
+panel_scheme(){ [[ -n "$(get_env UVICORN_SSL_CERTFILE)" ]] && echo https || echo http; }
+panel_url(){
+  local ip port scheme domain
+  ip=$(get_ip); port=$(get_port); scheme=$(panel_scheme); domain=$(get_domain_from_cert)
+  if [[ -n "$domain" && "$scheme" == https ]]; then
+    [[ "$port" == 443 ]] && echo "${scheme}://${domain}/dashboard/" || echo "${scheme}://${domain}:${port}/dashboard/"
+  else
+    if [[ "$port" == 443 && "$scheme" == https ]] || [[ "$port" == 80 && "$scheme" == http ]]; then echo "${scheme}://${ip}/dashboard/"
+    else echo "${scheme}://${ip}:${port}/dashboard/"; fi
+  fi
+}
+panel_image(){
+  local cid; cid=$(dc ps -q "$(app_svc)" 2>/dev/null | head -1)
+  [[ -n "$cid" ]] && docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null
+}
+panel_running(){ docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -qiE 'pasarguard.*Up'; }
+db_running(){ docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -qiE '(postgres|timescale|mysql|maria).*Up'; }
+
+_svc_status(){
+  local st
+  panel_running && st="${GREEN}Panel:UP${NC}" || st="${RED}Panel:DOWN${NC}"
+  if grep -qE 'sqlite' <<<"$(get_env SQLALCHEMY_DATABASE_URL)"; then st="$st  ${GREEN}DB:SQLite${NC}"
+  elif db_running; then st="$st  ${GREEN}DB:UP${NC}"; else st="$st  ${RED}DB:DOWN${NC}"; fi
+  echo -e "$st"
+}
 header(){
   clear
   echo -e "${GREEN}"
   echo "  ╔══════════════════════════════════════════════════╗"
-  echo "  ║         PasarGuard Manager  v${SCRIPT_VERSION}             ║"
+  printf "  ║         PasarGuard Manager  v%-8s            ║\n" "$SCRIPT_VERSION"
   echo "  ╚══════════════════════════════════════════════════╝"
   echo -e "${NC}"
   if has_pg && [[ -f "$ENV_FILE" ]]; then
@@ -85,340 +210,773 @@ header(){
     hr
   fi
 }
-
-get_env(){
-  local k="$1"
-  [[ -f "$ENV_FILE" ]] && grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ' || true
-}
-
-_CACHED_IP=""
-get_ip(){
-  # Cache IP for this session (avoid slow external calls)
-  if [[ -n "$_CACHED_IP" ]]; then
-    echo "$_CACHED_IP"
-    return
-  fi
-  _CACHED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  if [[ -z "$_CACHED_IP" ]]; then
-    _CACHED_IP=$(curl -s4 --max-time 2 ifconfig.me 2>/dev/null || curl -s4 --max-time 2 api.ipify.org 2>/dev/null || echo "unknown")
-  fi
-  echo "$_CACHED_IP"
-}
-
-get_domain_from_cert(){
-  local cert domain
-  cert=$(get_env UVICORN_SSL_CERTFILE)
-  [[ -z "$cert" ]] && return
-  if echo "$cert" | grep -qE 'certs/[^/]+/'; then
-    domain=$(echo "$cert" | sed -n 's|.*/certs/\([^/]*\)/.*|\1|p')
-  elif echo "$cert" | grep -q 'letsencrypt/live/'; then
-    domain=$(echo "$cert" | sed -n 's|.*/live/\([^/]*\)/.*|\1|p')
-  fi
-  echo "$domain"
-}
-
-get_port(){
-  local p; p=$(get_env UVICORN_PORT); echo "${p:-8000}"
-}
-
-panel_url(){
-  local ip port scheme cert domain
-  ip=$(get_ip); port=$(get_port); cert=$(get_env UVICORN_SSL_CERTFILE)
-  domain=$(get_domain_from_cert)
-  [[ -n "$cert" ]] && scheme=https || scheme=http
-  if [[ -n "$domain" && "$scheme" == "https" ]]; then
-    if [[ "$port" == "443" ]]; then
-      echo "${scheme}://${domain}/dashboard/"
-    else
-      echo "${scheme}://${domain}:${port}/dashboard/"
-    fi
-  else
-    if [[ "$port" == "443" && "$scheme" == "https" ]] || [[ "$port" == "80" && "$scheme" == "http" ]]; then
-      echo "${scheme}://${ip}/dashboard/"
-    else
-      echo "${scheme}://${ip}:${port}/dashboard/"
-    fi
-  fi
-}
-
 show_info(){
-  local cert domain ip port
-  cert=$(get_env UVICORN_SSL_CERTFILE)
-  domain=$(get_domain_from_cert)
-  ip=$(get_ip)
-  port=$(get_port)
+  local cert domain; cert=$(get_env UVICORN_SSL_CERTFILE); domain=$(get_domain_from_cert)
   echo -e "  ${BOLD}Panel Info${NC}"; hr
   echo -e "  Link : ${GREEN}$(panel_url)${NC}"
-  echo -e "  IP   : ${CYAN}${ip}${NC}"
-  echo -e "  Port : ${CYAN}${port}${NC}"
+  echo -e "  IP   : ${CYAN}$(get_ip)${NC}"
+  echo -e "  Port : ${CYAN}$(get_port)${NC}"
   if [[ -n "$cert" && -f "$cert" ]]; then
-    echo -e "  SSL  : ${GREEN}ON${NC}"
-    [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}${domain}${NC}"
+    echo -e "  SSL  : ${GREEN}ON${NC}"; [[ -n "$domain" ]] && echo -e "  Dom  : ${GREEN}${domain}${NC}"
   elif [[ -n "$cert" ]]; then
-    echo -e "  SSL  : ${YELLOW}CONFIGURED (file missing)${NC}"
-    echo -e "  Path : ${cert}"
+    echo -e "  SSL  : ${YELLOW}CONFIGURED (file missing)${NC}"; echo -e "  Path : ${cert}"
+  else echo -e "  SSL  : ${YELLOW}OFF${NC}"; fi
+  hr
+}
+
+# ═════════════════ Database layer (PG / Timescale / MySQL / MariaDB / SQLite) ═════════════════
+DB_KIND=""; DB_USER=""; DB_PASS=""; DB_PASS_RAW=""; DB_NAME=""; DB_SVC=""; DB_CID=""; DB_TS=0; SQLITE_FILE=""
+urldecode(){ local s="$1"; printf '%b' "${s//%/\\x}"; }
+
+db_detect(){
+  DB_KIND=""; DB_USER=""; DB_PASS=""; DB_PASS_RAW=""; DB_NAME=""; DB_SVC=""; DB_CID=""; DB_TS=0; SQLITE_FILE=""
+  local url scheme rest creds hostpart
+  url=$(get_env SQLALCHEMY_DATABASE_URL)
+  if [[ -n "$url" ]]; then
+    scheme=${url%%://*}; rest=${url#*://}
+    case "$scheme" in
+      sqlite*)            DB_KIND=sqlite ;;
+      postgres*)          DB_KIND=postgres ;;
+      mysql*|mariadb*)    DB_KIND=mysql ;;
+    esac
+    if [[ "$DB_KIND" == postgres || "$DB_KIND" == mysql ]]; then
+      creds=${rest%@*}; hostpart=${rest##*@}
+      DB_USER=$(urldecode "${creds%%:*}")
+      DB_PASS_RAW="${creds#*:}"; DB_PASS=$(urldecode "$DB_PASS_RAW")
+      DB_NAME=${hostpart#*/}; DB_NAME=${DB_NAME%%\?*}; DB_NAME=${DB_NAME%%/*}
+    fi
+  fi
+  if [[ -z "$DB_KIND" ]]; then
+    SQLITE_FILE=$(find "$DATA_DIR" -maxdepth 2 \( -name '*.sqlite3' -o -name '*.db' \) 2>/dev/null | head -1)
+    [[ -n "$SQLITE_FILE" ]] && DB_KIND=sqlite
+  fi
+  if [[ "$DB_KIND" == sqlite && -z "$SQLITE_FILE" ]]; then
+    SQLITE_FILE=$(find "$DATA_DIR" -maxdepth 2 \( -name '*.sqlite3' -o -name '*.db' \) 2>/dev/null | head -1)
+  fi
+  if [[ "$DB_KIND" == postgres || "$DB_KIND" == mysql ]]; then
+    DB_SVC=$(db_service)
+    [[ -n "$DB_SVC" ]] && DB_CID=$(dc ps -q "$DB_SVC" 2>/dev/null | head -1)
+    if [[ -z "$DB_CID" ]]; then
+      DB_CID=$(docker ps -q --filter name=timescale --filter name=postgres --filter name=mysql --filter name=maria 2>/dev/null | head -1)
+    fi
+    grep -qi timescale "$COMPOSE_FILE" 2>/dev/null && DB_TS=1
+  fi
+}
+db_label(){
+  case "$DB_KIND" in
+    postgres) [[ $DB_TS -eq 1 ]] && echo "TimescaleDB (PostgreSQL)" || echo "PostgreSQL" ;;
+    mysql)    echo "MySQL / MariaDB" ;;
+    sqlite)   echo "SQLite" ;;
+    *)        echo "unknown" ;;
+  esac
+}
+sqlite_q(){  # sqlite_q file sql
+  if has_cmd sqlite3; then sqlite3 -separator $'\t' "$1" "$2"
+  elif has_cmd python3; then
+    python3 - "$1" "$2" <<'PY'
+import sys, sqlite3
+c = sqlite3.connect(sys.argv[1])
+for r in c.execute(sys.argv[2]):
+    print("\t".join("" if x is None else str(x) for x in r))
+PY
+  else return 1; fi
+}
+sqlite_snapshot(){  # sqlite_snapshot src dst  (consistent copy even while panel writes)
+  if has_cmd sqlite3; then sqlite3 "$1" ".backup '$2'"
+  elif has_cmd python3; then
+    python3 - "$1" "$2" <<'PY'
+import sys, sqlite3
+s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()
+PY
+  else cp -a "$1" "$2"; fi
+}
+db_sql(){   # db_sql "SQL"  → TSV on stdout, non-zero on error
+  case "$DB_KIND" in
+    postgres)
+      docker exec -i -e PGPASSWORD="$DB_PASS" "$DB_CID" psql -U "$DB_USER" -d "$DB_NAME" -At -F $'\t' -v ON_ERROR_STOP=1 -c "$1" 2>/dev/null ;;
+    mysql)
+      docker exec -i -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'B=$(command -v mysql || command -v mariadb); exec "$B" -u"$1" -N -B "$2" -e "$3"' sh "$DB_USER" "$DB_NAME" "$1" 2>/dev/null ;;
+    sqlite)
+      sqlite_q "$SQLITE_FILE" "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+db_count(){ db_sql "SELECT COUNT(*) FROM $1;" | head -1; }
+db_ready(){  # db_ready → 0 when DB answers
+  case "$DB_KIND" in
+    postgres) docker exec -e PGPASSWORD="$DB_PASS" "$DB_CID" pg_isready -U "$DB_USER" -d postgres &>/dev/null ;;
+    mysql)    db_sql "SELECT 1;" &>/dev/null ;;
+    sqlite)   return 0 ;;
+    *) return 1 ;;
+  esac
+}
+wait_db(){  # wait_db [seconds]
+  local t="${1:-120}" i=0
+  while (( i < t )); do
+    db_detect
+    [[ -n "$DB_CID" || "$DB_KIND" == sqlite ]] && db_ready && return 0
+    sleep 2; i=$((i+2))
+  done
+  return 1
+}
+print_tsv(){
+  if has_cmd column; then column -t -s $'\t' | sed 's/^/    /'
+  else awk -F'\t' '{for(i=1;i<=NF;i++){c[NR,i]=$i; if(length($i)>w[i])w[i]=length($i)} n=NR; m=(NF>m?NF:m)} END{for(r=1;r<=n;r++){printf "    "; for(i=1;i<=m;i++)printf "%-*s  ", w[i], c[r,i]; printf "\n"}}'; fi
+}
+
+# ═════════════════ Database overview (the "show me my DB" screen) ═════════════════
+fmt_bytes(){ if [[ "$1" =~ ^[0-9]+$ ]]; then human "$1"; else echo "$1"; fi; }
+
+db_overview(){
+  db_detect
+  echo -e "  ${BOLD}Database Overview${NC}"; hr
+  if [[ -z "$DB_KIND" ]]; then err "No database detected (is the panel installed?)"; return 1; fi
+  echo -e "  Type      : ${GREEN}$(db_label)${NC}"
+  if [[ "$DB_KIND" != sqlite ]]; then
+    if [[ -z "$DB_CID" ]] || ! db_ready; then
+      echo -e "  Status    : ${RED}DOWN / not reachable${NC}"
+      echo "  Name/User : ${DB_NAME} / ${DB_USER}"
+      echo "  (start it with: pasarguard up)"; return 1
+    fi
+    echo -e "  Status    : ${GREEN}UP${NC}  (container $(docker inspect -f '{{.Name}}' "$DB_CID" 2>/dev/null | tr -d /))"
+    echo "  Database  : ${DB_NAME}   User: ${DB_USER}"
   else
-    echo -e "  SSL  : ${YELLOW}OFF${NC}"
+    echo "  File      : ${SQLITE_FILE:-not found}"
+  fi
+  case "$DB_KIND" in
+    postgres)
+      echo "  Version   : $(db_sql 'SHOW server_version;')"
+      echo "  Size      : $(db_sql 'SELECT pg_size_pretty(pg_database_size(current_database()));')"
+      echo "  Conns     : $(db_sql 'SELECT count(*) FROM pg_stat_activity WHERE datname=current_database();')"
+      [[ $DB_TS -eq 1 ]] && echo "  Timescale : $(db_sql "SELECT extversion FROM pg_extension WHERE extname='timescaledb';")"
+      hr; echo -e "  ${BOLD}Tables (exact rows)${NC}"
+      { printf 'TABLE\tROWS\tSIZE\n'
+        db_sql "SELECT t.table_name, (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', t.table_schema, t.table_name), false, true, '')))[1]::text, pg_size_pretty(pg_total_relation_size(quote_ident(t.table_schema)||'.'||quote_ident(t.table_name))) FROM information_schema.tables t WHERE t.table_schema='public' AND t.table_type='BASE TABLE' ORDER BY pg_total_relation_size(quote_ident(t.table_schema)||'.'||quote_ident(t.table_name)) DESC;"
+      } | print_tsv ;;
+    mysql)
+      echo "  Version   : $(db_sql 'SELECT VERSION();')"
+      echo "  Size      : $(db_sql "SELECT CONCAT(ROUND(SUM(data_length+index_length)/1024/1024,2),' MB') FROM information_schema.tables WHERE table_schema=DATABASE();")"
+      hr; echo -e "  ${BOLD}Tables (rows ≈ estimate)${NC}"
+      { printf 'TABLE\tROWS~\tSIZE_MB\n'
+        db_sql "SELECT table_name, table_rows, ROUND((data_length+index_length)/1024/1024,2) FROM information_schema.tables WHERE table_schema=DATABASE() ORDER BY (data_length+index_length) DESC;"
+      } | print_tsv ;;
+    sqlite)
+      echo "  Size      : $(du -h "$SQLITE_FILE" 2>/dev/null | cut -f1)"
+      hr; echo -e "  ${BOLD}Tables${NC}"
+      { printf 'TABLE\tROWS\n'
+        local t
+        for t in $(sqlite_q "$SQLITE_FILE" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"); do
+          printf '%s\t%s\n' "$t" "$(sqlite_q "$SQLITE_FILE" "SELECT COUNT(*) FROM \"$t\";")"
+        done
+      } | print_tsv ;;
+  esac
+
+  # ── Panel summary (guarded: silently skipped if schema differs) ──
+  local out
+  hr; echo -e "  ${BOLD}Panel Summary${NC}"
+  if out=$(db_sql "SELECT COUNT(*), COALESCE(SUM(used_traffic),0) FROM users;"); then
+    local total used; total=$(cut -f1 <<<"$out"); used=$(cut -f2 <<<"$out")
+    echo -e "  Users total : ${GREEN}${total}${NC}    Traffic used: ${CYAN}$(fmt_bytes "${used%%.*}")${NC}"
+    if out=$(db_sql "SELECT status, COUNT(*) FROM users GROUP BY status ORDER BY 2 DESC;"); then
+      { printf 'STATUS\tCOUNT\n'; echo "$out"; } | print_tsv
+    fi
+  else echo "  (users table not readable)"; fi
+  if out=$(db_sql "SELECT username FROM admins;"); then
+    echo -e "  Admins      : ${CYAN}$(echo "$out" | paste -sd, -)${NC}"
+  fi
+  if out=$(db_sql "SELECT name, address, port, status FROM nodes;") || out=$(db_sql "SELECT name, address, status FROM nodes;") || out=$(db_sql "SELECT name, status FROM nodes;"); then
+    if [[ -n "$out" ]]; then echo -e "  ${BOLD}Nodes${NC}"; { printf 'NAME\tADDRESS/PORT/STATUS\n'; echo "$out"; } | print_tsv; else echo "  Nodes       : none"; fi
   fi
   hr
 }
 
-free_port_80(){
-  echo -e "  ${YELLOW}Freeing port 80...${NC}"
-  has_pg && pasarguard down 2>/dev/null || true
-  # stop common web servers
-  systemctl stop nginx 2>/dev/null || true
-  systemctl stop apache2 2>/dev/null || true
-  systemctl stop caddy 2>/dev/null || true
-  fuser -k 80/tcp 2>/dev/null || true
-  sleep 1
-  if ss -tlnp | grep -q ':80 '; then
-    echo -e "  ${RED}Port 80 still busy:${NC}"
-    ss -tlnp | grep ':80 '
-    return 1
+db_show_connection(){
+  db_detect
+  echo -e "  ${BOLD}Database connection${NC}"; hr
+  local url; url=$(get_env SQLALCHEMY_DATABASE_URL)
+  echo "  Type : $(db_label)"
+  if [[ -z "$url" ]]; then echo "  SQLALCHEMY_DATABASE_URL not set (default SQLite)"; return; fi
+  if confirm "Show password in clear text?" n; then echo "  URL  : $url"
+  else echo "  URL  : $(sed -E 's|(://[^:]+:)[^@]*@|\1*****@|' <<<"$url")"; fi
+  grep -iE '^(DB_|POSTGRES_|MYSQL_|MARIADB_)' "$ENV_FILE" 2>/dev/null | sed -E 's/(PASSWORD=).*/\1*****/I' | sed 's/^/  /'
+}
+
+db_shell(){
+  db_detect
+  case "$DB_KIND" in
+    postgres) docker exec -it -e PGPASSWORD="$DB_PASS" "$DB_CID" psql -U "$DB_USER" -d "$DB_NAME" ;;
+    mysql)    docker exec -it -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'B=$(command -v mysql || command -v mariadb); exec "$B" -u"$1" "$2"' sh "$DB_USER" "$DB_NAME" ;;
+    sqlite)   has_cmd sqlite3 && sqlite3 "$SQLITE_FILE" || err "sqlite3 not installed (apt install sqlite3)" ;;
+    *) err "No database detected" ;;
+  esac
+}
+
+db_vacuum(){
+  db_detect
+  case "$DB_KIND" in
+    postgres) info "VACUUM (ANALYZE)..."; docker exec -e PGPASSWORD="$DB_PASS" "$DB_CID" psql -U "$DB_USER" -d "$DB_NAME" -c "VACUUM (ANALYZE);" && ok "Done" ;;
+    mysql)
+      info "OPTIMIZE all tables..."
+      local t; for t in $(db_sql "SHOW TABLES;"); do db_sql "OPTIMIZE TABLE \`$t\`;" >/dev/null; done; ok "Done" ;;
+    sqlite)
+      pasarguard down 2>/dev/null || dc stop "$(app_svc)" 2>/dev/null
+      sqlite_q "$SQLITE_FILE" "VACUUM;" && ok "Done"
+      pasarguard up 2>/dev/null || dc up -d ;;
+    *) err "No database detected" ;;
+  esac
+}
+
+# Dump DB only → file (any DB type)
+db_dump_only(){  # db_dump_only [outfile]
+  db_detect
+  local out="${1:-}" ts; ts=$(date +%F-%H%M)
+  case "$DB_KIND" in
+    postgres)
+      out="${out:-/root/pg-db-${ts}.dump}"
+      docker exec -e PGPASSWORD="$DB_PASS" "$DB_CID" pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc -f /tmp/pgm.dump \
+        && docker cp "$DB_CID":/tmp/pgm.dump "$out" && docker exec "$DB_CID" rm -f /tmp/pgm.dump ;;
+    mysql)
+      out="${out:-/root/pg-db-${ts}.sql}"
+      docker exec -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'D=$(command -v mysqldump || command -v mariadb-dump); exec "$D" -u"$1" --single-transaction --routines --triggers --no-tablespaces "$2"' sh "$DB_USER" "$DB_NAME" > "$out" 2>/dev/null \
+      || docker exec -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'D=$(command -v mysqldump || command -v mariadb-dump); exec "$D" -u"$1" --single-transaction --routines --triggers "$2"' sh "$DB_USER" "$DB_NAME" > "$out" ;;
+    sqlite)
+      out="${out:-/root/pg-db-${ts}.sqlite3}"; sqlite_snapshot "$SQLITE_FILE" "$out" ;;
+    *) err "No database detected"; return 1 ;;
+  esac
+  if [[ -s "$out" ]]; then chmod 600 "$out"; ok "Saved: $out ($(du -h "$out" | cut -f1))"; else err "Dump failed"; return 1; fi
+}
+
+pg_import(){   # pg_import dumpfile  (PostgreSQL / TimescaleDB)
+  local f="$1" c="$DB_CID" has_ts=0
+  psqlc(){ docker exec -e PGPASSWORD="$DB_PASS" "$c" psql -U "$DB_USER" -v ON_ERROR_STOP=0 "$@"; }
+  docker cp "$f" "$c":/tmp/pgm.dump || return 1
+  [[ -n "$(psqlc -d postgres -Atc "SELECT 1 FROM pg_extension WHERE extname='timescaledb' UNION SELECT 1 FROM pg_available_extensions WHERE name='timescaledb' LIMIT 1;" 2>/dev/null)" ]] && has_ts=1
+  if ! psqlc -d postgres -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE);" >/dev/null 2>&1; then
+    psqlc -d "$DB_NAME" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null 2>&1
+  else
+    psqlc -d postgres -c "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_USER\";" >/dev/null 2>&1
   fi
-  echo -e "  ${GREEN}Port 80 is free${NC}"
+  if [[ $has_ts -eq 1 ]]; then
+    psqlc -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb;" >/dev/null 2>&1
+    psqlc -d "$DB_NAME" -c "SELECT timescaledb_pre_restore();" >/dev/null 2>&1
+  fi
+  docker exec -e PGPASSWORD="$DB_PASS" "$c" pg_restore -U "$DB_USER" -d "$DB_NAME" --no-owner --no-privileges /tmp/pgm.dump 2>/tmp/pgm-restore.err
+  local rc=$?
+  [[ $has_ts -eq 1 ]] && psqlc -d "$DB_NAME" -c "SELECT timescaledb_post_restore();" >/dev/null 2>&1
+  docker exec "$c" rm -f /tmp/pgm.dump >/dev/null 2>&1
+  # pg_restore reports harmless "already exists" errors for extensions — only real data failure matters (checked by caller via row counts)
+  [[ $rc -ne 0 ]] && warn "pg_restore reported $(grep -c 'error' /tmp/pgm-restore.err 2>/dev/null) message(s) — see /tmp/pgm-restore.err"
+  return 0
+}
+mysql_import(){  # mysql_import file.sql
+  docker exec -i -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'B=$(command -v mysql || command -v mariadb); exec "$B" -u"$1" "$2"' sh "$DB_USER" "$DB_NAME" < "$1"
+}
+
+# ═════════════════ Backup (full, self-contained, migration-ready) ═════════════════
+BACKUP_RESULT=""
+create_backup(){   # create_backup full|lite [tag]
+  local kind="${1:-full}" tag="${2:-backup}" ts host out stage db_file="" sqlite_name=""
+  BACKUP_RESULT=""
+  if [[ ! -f "$ENV_FILE" && ! -d "$DATA_DIR" ]]; then err "PasarGuard not found in $APP_DIR"; return 1; fi
+  mkdir -p "$LOCAL_BACKUP_DIR"; chmod 700 "$LOCAL_BACKUP_DIR"
+  ts=$(date +%Y%m%d-%H%M%S); host=$(hostname -s)
+  out="${LOCAL_BACKUP_DIR}/pg-m-${tag}-${host}-${kind}-${ts}.tar.gz"
+  stage=$(mktemp -d -p /var/tmp pg-m-stage.XXXXXX) || { err "Cannot create temp dir"; return 1; }
+  mkdir -p "$stage/db" "$stage/files" "$stage/misc"
+
+  db_detect
+  info "Database: $(db_label)"
+  case "$DB_KIND" in
+    postgres)
+      if [[ -z "$DB_CID" ]] || ! db_ready; then err "Database container is not running (pasarguard up)"; rm -rf "$stage"; return 1; fi
+      docker exec -e PGPASSWORD="$DB_PASS" "$DB_CID" pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc -f /tmp/pgm.dump \
+        && docker cp "$DB_CID":/tmp/pgm.dump "$stage/db/dump.pgc" >/dev/null \
+        && docker exec "$DB_CID" rm -f /tmp/pgm.dump
+      if [[ ! -s "$stage/db/dump.pgc" ]]; then err "pg_dump failed"; rm -rf "$stage"; return 1; fi
+      db_file="dump.pgc" ;;
+    mysql)
+      if [[ -z "$DB_CID" ]] || ! db_ready; then err "Database container is not running (pasarguard up)"; rm -rf "$stage"; return 1; fi
+      docker exec -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'D=$(command -v mysqldump || command -v mariadb-dump); exec "$D" -u"$1" --single-transaction --routines --triggers --no-tablespaces "$2"' sh "$DB_USER" "$DB_NAME" > "$stage/db/dump.sql" 2>/dev/null \
+      || docker exec -e MYSQL_PWD="$DB_PASS" "$DB_CID" sh -c 'D=$(command -v mysqldump || command -v mariadb-dump); exec "$D" -u"$1" --single-transaction --routines --triggers "$2"' sh "$DB_USER" "$DB_NAME" > "$stage/db/dump.sql" 2>/dev/null
+      if [[ ! -s "$stage/db/dump.sql" ]]; then err "mysqldump failed"; rm -rf "$stage"; return 1; fi
+      db_file="dump.sql" ;;
+    sqlite)
+      sqlite_name=$(basename "$SQLITE_FILE")
+      sqlite_snapshot "$SQLITE_FILE" "$stage/db/$sqlite_name"
+      if [[ ! -s "$stage/db/$sqlite_name" ]]; then err "SQLite snapshot failed"; rm -rf "$stage"; return 1; fi
+      db_file="$sqlite_name" ;;
+    *) warn "No database detected — backing up files only" ;;
+  esac
+  [[ -n "$db_file" ]] && ok "Database dumped ($(du -h "$stage/db/$db_file" | cut -f1))"
+
+  # files
+  local excl=(--exclude='*.log' --exclude='*.log.*' --exclude='opt/pasarguard/backup')
+  [[ "$kind" == lite ]] && excl+=(--exclude='*.dat' --exclude='*.mmdb')
+  if [[ "$DB_KIND" == sqlite && -n "$SQLITE_FILE" ]]; then
+    excl+=(--exclude="${SQLITE_FILE#/}" --exclude="${SQLITE_FILE#/}-wal" --exclude="${SQLITE_FILE#/}-shm")
+  fi
+  local paths=() p
+  for p in opt/pasarguard var/lib/pasarguard etc/letsencrypt etc/nginx etc/pg-m; do [[ -e "/$p" ]] && paths+=("$p"); done
+  if [[ "$kind" == full ]]; then
+    for p in /opt/pg-node* /var/lib/pg-node*; do [[ -e "$p" ]] && paths+=("${p#/}"); done
+  fi
+  info "Collecting files: ${paths[*]}"
+  tar -C / "${excl[@]}" -cf - "${paths[@]}" 2>/dev/null | tar -C "$stage/files" -xf -
+
+  # misc (informational / cron)
+  crontab -l > "$stage/misc/crontab.txt" 2>/dev/null || true
+  cp -a /etc/cron.d/pg-m-* "$stage/misc/" 2>/dev/null || true
+  ufw status numbered > "$stage/misc/ufw.txt" 2>/dev/null || true
+  docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' > "$stage/misc/containers.txt" 2>/dev/null || true
+
+  # manifest
+  local domains users admins nodes
+  domains=$(collect_domains | paste -sd' ' -)
+  users=$(db_count users 2>/dev/null); admins=$(db_count admins 2>/dev/null); nodes=$(db_count nodes 2>/dev/null)
+  cat > "$stage/manifest.env" <<EOF
+PGM_VERSION="$SCRIPT_VERSION"
+CREATED="$(date '+%F %T %z')"
+SRC_HOST="$(hostname)"
+SRC_IP="$(get_ip)"
+KIND="$kind"
+TAG="$tag"
+DB_KIND="$DB_KIND"
+DB_TS="$DB_TS"
+DB_NAME="$DB_NAME"
+DB_USER="$DB_USER"
+DB_FILE="$db_file"
+SQLITE_NAME="$sqlite_name"
+PANEL_PORT="$(get_port)"
+PANEL_SCHEME="$(panel_scheme)"
+PANEL_IMAGE="$(panel_image)"
+DOMAINS="$domains"
+USERS="${users:-}"
+ADMINS="${admins:-}"
+NODES="${nodes:-}"
+EOF
+
+  info "Packing archive..."
+  if ! tar -C "$stage" -czf "$out" . ; then err "Packing failed"; rm -rf "$stage" "$out"; return 1; fi
+  chmod 600 "$out"
+  ( cd "$LOCAL_BACKUP_DIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  rm -rf "$stage"
+  BACKUP_RESULT="$out"
+  ok "Backup created: $out ($(du -h "$out" | cut -f1))"
+  log "backup created $out kind=$kind tag=$tag users=${users:-?}"
   return 0
 }
 
+prune_backups(){
+  local keep; keep=$(conf_get KEEP_BACKUPS); keep="${keep:-10}"
+  local f
+  ls -1t "$LOCAL_BACKUP_DIR"/pg-m-backup-*.tar.gz 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
+    rm -f "$f" "$f.sha256"; log "pruned old backup $f"
+  done
+}
+list_backups(){
+  echo -e "  ${BOLD}Backups in ${LOCAL_BACKUP_DIR}${NC}"; hr
+  local i=0 f
+  shopt -s nullglob
+  for f in $(ls -1t "$LOCAL_BACKUP_DIR"/pg-m-*.tar.gz 2>/dev/null); do
+    i=$((i+1)); printf "  %2d) %-62s %6s  %s\n" "$i" "$(basename "$f")" "$(du -h "$f" | cut -f1)" "$(date -r "$f" '+%F %H:%M')"
+  done
+  shopt -u nullglob
+  [[ $i -eq 0 ]] && echo "  (none)"
+  hr
+}
+pick_backup(){   # sets PICKED to a file path
+  PICKED=""
+  list_backups
+  local files n
+  mapfile -t files < <(ls -1t "$LOCAL_BACKUP_DIR"/pg-m-*.tar.gz 2>/dev/null)
+  echo "  Enter number from list, or a full path to a .tar.gz file"
+  read -rp "  Select: " n
+  [[ -z "$n" ]] && return 1
+  if [[ "$n" =~ ^[0-9]+$ && $n -ge 1 && $n -le ${#files[@]} ]]; then PICKED="${files[$((n-1))]}"
+  elif [[ -f "$n" ]]; then PICKED="$n"
+  else err "Not found"; return 1; fi
+}
+
+# ═════════════════ Restore (used by menu, CLI and remote migration) ═════════════════
+RESTORE_TMP=""
+mf(){ grep -E "^$1=" "$RESTORE_TMP/manifest.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//'; }
+
+restore_archive(){   # restore_archive file.tar.gz
+  local arc="$1" rc=0
+  [[ -f "$arc" ]] || { err "File not found: $arc"; return 1; }
+  if [[ -f "$arc.sha256" ]]; then
+    ( cd "$(dirname "$arc")" && sha256sum -c "$(basename "$arc").sha256" >/dev/null 2>&1 ) && ok "Checksum OK" || { err "Checksum mismatch — archive damaged"; return 1; }
+  fi
+  RESTORE_TMP=$(mktemp -d -p /var/tmp pg-m-restore.XXXXXX) || return 1
+  info "Extracting archive..."
+  tar -xzf "$arc" -C "$RESTORE_TMP" || { err "Cannot extract archive"; rm -rf "$RESTORE_TMP"; return 1; }
+  [[ -f "$RESTORE_TMP/manifest.env" ]] || { err "manifest.env missing — not a pg-m archive (use 'pasarguard restore' for official backups)"; rm -rf "$RESTORE_TMP"; return 1; }
+
+  echo -e "  ${BOLD}Archive contents${NC}"; hr
+  echo "  Created   : $(mf CREATED)   (pg-m $(mf PGM_VERSION))"
+  echo "  Source    : $(mf SRC_HOST) / $(mf SRC_IP)"
+  echo "  Database  : $(mf DB_KIND) ts=$(mf DB_TS)   users=$(mf USERS) admins=$(mf ADMINS) nodes=$(mf NODES)"
+  echo "  Domains   : $(mf DOMAINS)"
+  hr
+  if [[ $AUTO -ne 1 ]]; then
+    warn "This will OVERWRITE the panel configuration and database on THIS server."
+    confirm_yes "Continue" || { echo "  Cancelled"; rm -rf "$RESTORE_TMP"; return 1; }
+  fi
+
+  ensure_docker || { rm -rf "$RESTORE_TMP"; return 1; }
+  has_cmd curl || apt-get install -y -qq curl >/dev/null 2>&1
+
+  # safety snapshot of whatever is here now
+  if [[ -f "$COMPOSE_FILE" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi pasarguard; then
+    info "Existing panel found — taking a safety snapshot first..."
+    ( create_backup full pre-restore ) && ok "Safety snapshot saved in $LOCAL_BACKUP_DIR" || warn "Safety snapshot failed — continuing"
+    dc down 2>/dev/null || true
+  fi
+
+  info "Restoring files..."
+  mkdir -p /opt /var/lib /etc
+  tar -C "$RESTORE_TMP/files" -cf - . | tar -C / --no-overwrite-dir -xpf - || { err "File restore failed"; rm -rf "$RESTORE_TMP"; return 1; }
+  fix_compose_volumes
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  ok "Files restored"
+
+  local dbk db_file sqlite_name
+  db_detect; dbk="$DB_KIND"; db_file=$(mf DB_FILE); sqlite_name=$(mf SQLITE_NAME)
+
+  case "$dbk" in
+    sqlite)
+      mkdir -p "$DATA_DIR"
+      [[ -n "$db_file" && -f "$RESTORE_TMP/db/$db_file" ]] && cp -a "$RESTORE_TMP/db/$db_file" "$DATA_DIR/${sqlite_name:-$db_file}" && ok "SQLite database restored"
+      ;;
+    postgres|mysql)
+      local svc; svc=$(db_service)
+      [[ -z "$svc" ]] && { err "Cannot find DB service in compose file"; rm -rf "$RESTORE_TMP"; return 1; }
+      info "Starting database service ($svc)..."
+      dc pull -q "$svc" >/dev/null 2>&1 || true
+      dc up -d "$svc" || { err "Cannot start $svc"; rm -rf "$RESTORE_TMP"; return 1; }
+      info "Waiting for database to accept connections..."
+      if ! wait_db 240; then err "Database did not become ready (see: docker logs <db-container>)"; rm -rf "$RESTORE_TMP"; return 1; fi
+      info "Importing database..."
+      if [[ -n "$db_file" && -f "$RESTORE_TMP/db/$db_file" ]]; then
+        if [[ "$dbk" == postgres ]]; then pg_import "$RESTORE_TMP/db/$db_file"; else mysql_import "$RESTORE_TMP/db/$db_file"; fi
+        ok "Database import finished"
+      else warn "No database dump in archive"; fi
+      ;;
+  esac
+
+  info "Starting full stack..."
+  dc pull -q >/dev/null 2>&1 || true
+  dc up -d || { err "docker compose up failed"; rc=1; }
+
+  # install panel CLI + pg-m itself (best effort)
+  if ! has_pg; then
+    info "Installing official 'pasarguard' CLI..."
+    bash -c "$(curl -fsSL "$OFFICIAL_SCRIPT")" @ install-script >/dev/null 2>&1 || warn "Could not install CLI (not critical — compose is used directly)"
+  fi
+  self_install
+
+  # restore cron jobs of pg-m (Telegram backup etc.)
+  local cf; for cf in "$RESTORE_TMP"/misc/pg-m-*; do [[ -f "$cf" ]] && { cp -a "$cf" /etc/cron.d/; chmod 644 "/etc/cron.d/$(basename "$cf")"; }; done
+
+  # certbot + renewal hook (certs are already copied)
+  if [[ -d /etc/letsencrypt/renewal ]]; then
+    has_cmd certbot || apt-get install -y -qq certbot >/dev/null 2>&1 || true
+    install_cert_hook
+  fi
+
+  # firewall
+  if has_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "$(ssh_port)/tcp" >/dev/null 2>&1; ufw allow "$(get_port)/tcp" >/dev/null 2>&1
+    ufw allow 80/tcp >/dev/null 2>&1; ufw allow 443/tcp >/dev/null 2>&1
+    ok "UFW: opened SSH, 80, 443 and panel port"
+  fi
+
+  # verify
+  info "Waiting for panel to answer..."
+  local up=0 i code
+  for i in $(seq 1 45); do
+    code=$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "$(panel_scheme)://127.0.0.1:$(get_port)/dashboard/" 2>/dev/null)
+    [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && { up=1; break; }
+    sleep 2
+  done
+  [[ $up -eq 1 ]] && ok "Panel is answering (HTTP $code)" || { err "Panel is not answering yet — check: pasarguard logs"; rc=1; }
+
+  db_detect
+  local u a n ou oa on
+  u=$(db_count users 2>/dev/null); a=$(db_count admins 2>/dev/null); n=$(db_count nodes 2>/dev/null)
+  ou=$(mf USERS); oa=$(mf ADMINS); on=$(mf NODES)
+  echo -e "  ${BOLD}Verification (source → this server)${NC}"
+  printf "    users  : %s → %s  %s\n" "${ou:--}" "${u:--}" "$([[ -n "$ou" && "$ou" == "$u" ]] && echo '✔' || echo '✘ MISMATCH')"
+  printf "    admins : %s → %s  %s\n" "${oa:--}" "${a:--}" "$([[ -n "$oa" && "$oa" == "$a" ]] && echo '✔' || echo '✘ MISMATCH')"
+  printf "    nodes  : %s → %s  %s\n" "${on:--}" "${n:--}" "$([[ -n "$on" && "$on" == "$n" ]] && echo '✔' || echo '✘ MISMATCH')"
+  if [[ -n "$ou" && "$ou" != "$u" ]]; then err "User count differs — restore may be incomplete"; rc=1; fi
+  log "restore from $arc rc=$rc"
+  rm -rf "$RESTORE_TMP"
+  return $rc
+}
+
+self_install(){   # make sure /usr/local/bin/pg-m exists and is this script
+  local me; me=$(readlink -f "$0" 2>/dev/null)
+  if [[ -n "$me" && -f "$me" && "$me" != "$INSTALL_PATH" ]]; then
+    cp -f "$me" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+  fi
+}
+
+# ═════════════════ Telegram ═════════════════
+tg_curl(){ local a=(-s --max-time 180); local px; px=$(conf_get TG_PROXY); [[ -n "$px" ]] && a+=(-x "$px"); curl "${a[@]}" "$@"; }
+tg_send_text(){ tg_curl "https://api.telegram.org/bot$(conf_get TG_TOKEN)/sendMessage" -d chat_id="$(conf_get TG_CHAT)" --data-urlencode text="$1" | grep -q '"ok":true'; }
+tg_send_file(){  # tg_send_file path caption
+  local f="$1" cap="$2" token chat sz
+  token=$(conf_get TG_TOKEN); chat=$(conf_get TG_CHAT)
+  [[ -n "$token" && -n "$chat" ]] || { err "Telegram not configured"; return 1; }
+  sz=$(stat -c %s "$f")
+  if (( sz > 49000000 )); then
+    warn "File is $(human "$sz") (> 50MB Telegram limit) — sending in parts"
+    local d; d=$(mktemp -d -p /var/tmp pgm-split.XXXXXX)
+    split -b 45M -d "$f" "$d/$(basename "$f").part"
+    local p n=0 total; total=$(ls "$d" | wc -l)
+    for p in "$d"/*; do
+      n=$((n+1))
+      tg_curl -F chat_id="$chat" -F document=@"$p" -F caption="$cap (part $n/$total — join: cat *.part* > file.tar.gz)" \
+        "https://api.telegram.org/bot${token}/sendDocument" | grep -q '"ok":true' || { err "Part $n failed"; rm -rf "$d"; return 1; }
+    done
+    rm -rf "$d"; return 0
+  fi
+  tg_curl -F chat_id="$chat" -F document=@"$f" -F caption="$cap" "https://api.telegram.org/bot${token}/sendDocument" | grep -q '"ok":true'
+}
+telegram_backup_job(){   # called by cron
+  AUTO=1
+  exec 9>/var/lock/pg-m-backup.lock; flock -n 9 || { echo "another backup running"; return 1; }
+  local mode; mode=$(conf_get TG_MODE); mode="${mode:-lite}"
+  create_backup "$mode" backup || { tg_send_text "❌ pg-m backup FAILED on $(hostname)"; return 1; }
+  prune_backups
+  if [[ -n "$(conf_get TG_TOKEN)" ]]; then
+    tg_send_file "$BACKUP_RESULT" "✅ $(hostname) | $(date '+%F %H:%M') | pg-m $SCRIPT_VERSION | $mode" \
+      && log "telegram backup sent" || { log "telegram send failed"; return 1; }
+  fi
+}
+telegram_setup(){
+  header; echo -e "  ${BOLD}Telegram Auto-Backup${NC}"; hr
+  local tok chat
+  echo "  Current: token=$([[ -n "$(conf_get TG_TOKEN)" ]] && echo set || echo none)  chat=$(conf_get TG_CHAT)  every=$(conf_get TG_INTERVAL)h  mode=$(conf_get TG_MODE)"
+  echo "  1. Configure / change"
+  echo "  2. Send test message"
+  echo "  3. Send a backup now"
+  echo "  4. Disable auto-backup"
+  echo "  0. Back"; hr
+  read -rp "  Select: " o
+  case $o in
+    1)
+      echo "  Create a bot with @BotFather → token. Get your chat id from @userinfobot"
+      ask "Bot token" tok; ask "Chat ID" chat
+      [[ -z "$tok" || -z "$chat" ]] && { err "Both required"; return; }
+      conf_set TG_TOKEN "$tok"; conf_set TG_CHAT "$chat"
+      echo "  Optional proxy for Telegram (e.g. socks5h://127.0.0.1:1080) — empty for none"
+      ask "Proxy" px ""; [[ -n "$px" ]] && conf_set TG_PROXY "$px" || conf_del TG_PROXY
+      echo "  Interval (hours): 1 3 6 12 24"; ask "Every N hours" iv 6
+      [[ "$iv" =~ ^[0-9]+$ && $iv -ge 1 && $iv -le 24 ]] || iv=6
+      echo "  Mode: lite = DB+config (small, for Telegram)   full = everything incl. geo files/nodes"
+      ask "Mode (lite/full)" md lite; [[ "$md" == full ]] || md=lite
+      ask "Keep how many local backups" kp 10; [[ "$kp" =~ ^[0-9]+$ ]] || kp=10
+      conf_set TG_INTERVAL "$iv"; conf_set TG_MODE "$md"; conf_set KEEP_BACKUPS "$kp"
+      echo "0 */${iv} * * * root $INSTALL_PATH --telegram-backup >> $LOG_FILE 2>&1" > /etc/cron.d/pg-m-backup
+      [[ "$iv" == 24 ]] && echo "0 3 * * * root $INSTALL_PATH --telegram-backup >> $LOG_FILE 2>&1" > /etc/cron.d/pg-m-backup
+      chmod 644 /etc/cron.d/pg-m-backup
+      if tg_send_text "✅ pg-m backup linked on $(hostname)"; then ok "Test message delivered — auto-backup every ${iv}h enabled"
+      else err "Telegram test failed — check token / chat id / proxy"; fi ;;
+    2) tg_send_text "pg-m test from $(hostname)" && ok "Sent" || err "Failed" ;;
+    3) telegram_backup_job && ok "Backup sent" || err "Failed" ;;
+    4) rm -f /etc/cron.d/pg-m-backup; ok "Auto-backup disabled" ;;
+  esac
+}
+
+# ═════════════════ Domains / DNS / Cloudflare ═════════════════
+collect_domains(){
+  local d n
+  {
+    for d in /etc/letsencrypt/live/*/; do
+      n=$(basename "$d"); [[ "$n" == README || ! -f "${d}fullchain.pem" ]] && continue
+      echo "$n"
+      openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://'
+    done
+    for d in "$DATA_DIR"/certs/*/; do [[ -d "$d" ]] && basename "$d"; done
+  } 2>/dev/null | grep -E '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' | sort -u
+}
+dns_resolve(){ getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+
+dns_report(){   # dns_report [target_ip]  → table of domains vs IP
+  local target="${1:-$(get_ip)}" d ip st doms
+  doms=$(collect_domains)
+  [[ -z "$doms" ]] && { echo "  (no domains found in certificates)"; return 1; }
+  echo -e "  Target IP: ${CYAN}${target}${NC}"
+  while read -r d; do
+    ip=$(dns_resolve "$d")
+    if [[ -z "$ip" ]]; then st="${RED}no A record${NC}"
+    elif [[ "$ip" == "$target" ]]; then st="${GREEN}OK → points here${NC}"
+    else st="${YELLOW}points to ${ip}${NC}"; fi
+    printf "  %-40s %b\n" "$d" "$st"
+  done <<<"$doms"
+}
+
+cf_have(){ [[ -n "$(conf_get CF_TOKEN)" ]]; }
+cf_api(){   # cf_api METHOD /path [json]
+  curl -s --max-time 25 -X "$1" "https://api.cloudflare.com/client/v4$2" \
+    -H "Authorization: Bearer $(conf_get CF_TOKEN)" -H "Content-Type: application/json" ${3:+--data "$3"}
+}
+cf_zone_id(){
+  local d="$1" L n i cand id
+  IFS=. read -ra L <<<"$d"; n=${#L[@]}
+  for ((i=0; i<n-1; i++)); do
+    cand=$(IFS=.; echo "${L[*]:i}")
+    id=$(cf_api GET "/zones?name=${cand}" | jq -r '.result[0].id // empty' 2>/dev/null)
+    [[ -n "$id" ]] && { echo "$id"; return 0; }
+  done
+  return 1
+}
+cf_set_a(){   # cf_set_a domain ip
+  local d="$1" ip="$2" z rec res
+  has_cmd jq || apt-get install -y -qq jq >/dev/null 2>&1
+  z=$(cf_zone_id "$d") || { err "$d: zone not found in this Cloudflare account"; return 1; }
+  rec=$(cf_api GET "/zones/${z}/dns_records?type=A&name=${d}" | jq -r '.result[0].id // empty')
+  if [[ -n "$rec" ]]; then
+    res=$(cf_api PATCH "/zones/${z}/dns_records/${rec}" "$(jq -nc --arg c "$ip" '{content:$c}')")
+  else
+    res=$(cf_api POST "/zones/${z}/dns_records" "$(jq -nc --arg n "$d" --arg c "$ip" '{type:"A",name:$n,content:$c,ttl:1,proxied:false}')")
+  fi
+  if [[ "$(jq -r '.success' <<<"$res" 2>/dev/null)" == true ]]; then ok "$d → $ip"; return 0
+  else err "$d: $(jq -r '.errors[0].message // "unknown error"' <<<"$res" 2>/dev/null)"; return 1; fi
+}
+cf_point_domains(){   # cf_point_domains ip
+  local ip="$1" d
+  has_cmd jq || apt-get install -y -qq jq >/dev/null 2>&1
+  for d in $(collect_domains); do cf_set_a "$d" "$ip"; done
+}
+
+m_domains(){
+  while true; do
+    header
+    echo -e "  ${BOLD}13. Domains & DNS${NC}"; hr
+    echo "  1. Show domains + DNS status (vs this server)"
+    echo "  2. Check one domain"
+    echo "  3. Set / change Cloudflare API token"
+    echo "  4. Point ALL panel domains to an IP (Cloudflare)"
+    echo "  5. Point ONE domain to an IP (Cloudflare)"
+    echo "  6. Remove Cloudflare token"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) dns_report; pause ;;
+      2) ask "Domain" d ""; [[ -n "$d" ]] && { echo "  $d → $(dns_resolve "$d" || echo none)   (this server: $(get_ip))"; }; pause ;;
+      3) echo "  Token needs: Zone → DNS → Edit  (+ Zone → Zone → Read)"
+         read -rsp "  API token: " t; echo; [[ -n "$t" ]] && { conf_set CF_TOKEN "$t"; ok "Saved (chmod 600 in $PGM_CONF)"; }; pause ;;
+      4) cf_have || { err "Set a Cloudflare token first (option 3)"; pause; continue; }
+         ask "Target IP" ip "$(get_ip)"; confirm "Update A records for: $(collect_domains | paste -sd' ' -) ?" y && cf_point_domains "$ip"; pause ;;
+      5) cf_have || { err "Set a Cloudflare token first (option 3)"; pause; continue; }
+         ask "Domain" d ""; ask "Target IP" ip "$(get_ip)"; [[ -n "$d" ]] && cf_set_a "$d" "$ip"; pause ;;
+      6) conf_del CF_TOKEN; ok "Removed"; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+# ═════════════════ SSL ═════════════════
+# Panel container ONLY sees files under DATA_DIR (/var/lib/pasarguard).
+# Never point UVICORN_SSL_* at /etc/letsencrypt directly.
+free_port_80(){
+  port_in_use 80 || { ok "Port 80 is free"; return 0; }
+  warn "Port 80 is busy:"; ss -tlnp | grep ':80 '
+  local s; for s in nginx apache2 caddy; do systemctl is-active --quiet "$s" 2>/dev/null && { info "Stopping $s"; systemctl stop "$s"; }; done
+  if port_in_use 80 && [[ "$(get_port)" == 80 ]]; then info "Panel uses port 80 — stopping panel temporarily"; has_pg && pasarguard down 2>/dev/null; fi
+  sleep 1
+  if port_in_use 80; then err "Port 80 still busy — free it manually, then retry"; return 1; fi
+  ok "Port 80 is free"; return 0
+}
 list_certs(){
   echo -e "  ${BOLD}Certificates${NC}"; hr
-  if [[ ! -d /etc/letsencrypt/live ]]; then
-    echo "  (none)"; return
-  fi
+  [[ -d /etc/letsencrypt/live ]] || { echo "  (none)"; return; }
   local d name exp status
   for d in /etc/letsencrypt/live/*/; do
-    [[ -d "$d" ]] || continue
-    name=$(basename "$d")
-    [[ "$name" == "README" ]] && continue
-    [[ -f "${d}fullchain.pem" ]] || continue
+    [[ -d "$d" ]] || continue; name=$(basename "$d"); [[ "$name" == README || ! -f "${d}fullchain.pem" ]] && continue
     exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
-    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then
-      status="${RED}EXPIRED${NC}"
-    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" 2>/dev/null; then
-      status="${YELLOW}Expires <30d${NC}"
-    else
-      status="${GREEN}Active${NC}"
-    fi
+    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${RED}EXPIRED${NC}"
+    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${YELLOW}Expires <30d${NC}"
+    else status="${GREEN}Active${NC}"; fi
     echo -e "  • ${CYAN}${name}${NC}  [${status}]"
-    echo -e "    Expiry : ${exp}"
-    echo -e "    Path   : ${d}fullchain.pem"
+    echo "    Expiry : ${exp}"
+    echo "    SANs   : $(openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
+    echo "    Path   : ${d}fullchain.pem"
   done
   hr
 }
-
-# ─────────────────── 2 Service ───────────────────
-m_service(){
-  while true; do
-    header
-    echo -e "  ${BOLD}2. Service Management${NC}"; hr
-    echo "  1. Start"
-    echo "  2. Stop"
-    echo "  3. Restart"
-    echo "  4. Status"
-    echo "  5. Logs (live)"
-    echo "  6. Logs (last lines)"
-    echo "  0. Back"; hr
-    read -rp "  Select: " o
-    case $o in
-      1) fix_compose_volumes; pasarguard up; pause ;;
-      2) pasarguard down; pause ;;
-      3) pg_restart; pause ;;
-      4) pasarguard status; pause ;;
-      5) pasarguard logs ;;
-      6) pasarguard logs -n; pause ;;
-      0) break ;;
-    esac
-  done
-}
-
-# ─────────────────── 1 Install ───────────────────
-m_install(){
-  while true; do
-    header
-    echo -e "  ${BOLD}1. Install / Update / Uninstall${NC}"; hr
-    echo "  1. Install TimescaleDB (recommended)"
-    echo "  2. Install PostgreSQL"
-    echo "  3. Install SQLite"
-    echo "  4. Install MySQL"
-    echo "  5. Install MariaDB"
-    echo "  6. Update panel"
-    echo "  7. Update to Pre-release / Dev"
-    echo "  8. Uninstall panel"
-    echo "  9. Reinstall CLI script"
-    echo "  0. Back"; hr
-    read -rp "  Select: " o
-    case $o in
-      1) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database timescaledb; pause ;;
-      2) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database postgresql; pause ;;
-      3) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install; pause ;;
-      4) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mysql; pause ;;
-      5) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database mariadb; pause ;;
-      6) pasarguard update; pause ;;
-      7) bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --pre-release; pause ;;
-      8) read -rp "  Type yes to uninstall: " c; [[ "$c" == yes ]] && pasarguard uninstall; pause ;;
-      9) pasarguard install-script; pause ;;
-      0) break ;;
-    esac
-  done
-}
-
-# ─────────────────── 2 Port ───────────────────
-m_port(){
-  while true; do
-    header
-    echo -e "  ${BOLD}2. Port & Access${NC}"; hr
-    show_info
-    echo "  1. Change panel port"
-    echo "  2. Open firewall for panel port"
-    echo "  3. Sub link port help"
-    echo "  0. Back"; hr
-    read -rp "  Select: " o
-    case $o in
-      1)
-        echo -e "  Current: ${CYAN}$(get_port)${NC} | Suggest: 8443 2083 2053 2087 2096"
-        read -rp "  New port: " np
-        if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 && -f "$ENV_FILE" ]]; then
-          if port_in_use "$np"; then
-            echo -e "  ${YELLOW}Warning: port ${np} already in use:${NC}"
-            ss -tlnp 2>/dev/null | grep -E ":${np}[[:space:]]" || true
-            read -rp "  Continue anyway? [y/N]: " cont
-            [[ "$cont" =~ ^[Yy]$ ]] || { echo "  Cancelled"; pause; continue; }
-          fi
-          grep -q '^UVICORN_PORT=' "$ENV_FILE" && sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE" || echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
-          ufw allow "${np}/tcp" 2>/dev/null || true
-          echo -e "  ${GREEN}Port set to ${np}${NC}"
-          pg_restart
-          show_info
-        else
-          echo -e "  ${RED}Invalid port or .env missing${NC}"
-        fi
-        pause
-        ;;
-      2)
-        p=$(get_port)
-        ufw allow 80/tcp 2>/dev/null || true
-        ufw allow 443/tcp 2>/dev/null || true
-        ufw allow "${p}/tcp" 2>/dev/null || true
-        echo -e "  ${GREEN}Opened 80, 443, ${p}${NC}"
-        pause
-        ;;
-      3)
-        echo "  Sub URL port = panel port / domain in Settings > Subscriptions"
-        echo "  Hosts page = inbound address/port inside configs (not sub URL)"
-        pause
-        ;;
-      0) break ;;
-    esac
-  done
-}
-
-# ─────────────────── 3 SSL ───────────────────
-# Panel container ONLY sees files under DATA_DIR (/var/lib/pasarguard).
-# Never point UVICORN_SSL_* at /etc/letsencrypt directly.
-
 copy_cert_to_panel(){
-  local domain="$1"
-  local src=""
-  # Prefer exact live dir; also accept first domain as folder name for multi-SAN certs
-  if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
-    src="/etc/letsencrypt/live/${domain}"
+  local domain="$1" src="" d
+  if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then src="/etc/letsencrypt/live/${domain}"
   else
-    # multi-domain certs live under the first -d name
     for d in /etc/letsencrypt/live/*/; do
       [[ -f "${d}fullchain.pem" ]] || continue
-      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}"; then
-        src="${d%/}"
-        break
-      fi
+      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}"; then src="${d%/}"; break; fi
     done
   fi
-  [[ -n "$src" && -f "${src}/fullchain.pem" ]] || { echo -e "  ${RED}No LE cert covering ${domain}${NC}"; return 1; }
+  [[ -n "$src" && -f "${src}/fullchain.pem" ]] || { err "No LE cert covering ${domain}"; return 1; }
   local dst="${DATA_DIR}/certs/${domain}"
   mkdir -p "$dst"
-  cp -L "${src}/fullchain.pem" "${dst}/fullchain.pem"
-  cp -L "${src}/privkey.pem" "${dst}/privkey.pem"
-  chmod 644 "${dst}/fullchain.pem"
-  chmod 600 "${dst}/privkey.pem"
-  echo -e "  ${GREEN}Copied → ${dst}${NC} (from ${src})"
+  cp -L "${src}/fullchain.pem" "${dst}/fullchain.pem"; cp -L "${src}/privkey.pem" "${dst}/privkey.pem"
+  chmod 644 "${dst}/fullchain.pem"; chmod 600 "${dst}/privkey.pem"
+  ok "Copied → ${dst} (from ${src})"
 }
-
 apply_cert_env(){
-  local domain="$1"
-  local dst="${DATA_DIR}/certs/${domain}"
-  [[ -f "${dst}/fullchain.pem" && -f "${dst}/privkey.pem" ]] || { echo -e "  ${RED}Missing files in ${dst}${NC}"; return 1; }
-  [[ -f "$ENV_FILE" ]] || { echo -e "  ${RED}No .env${NC}"; return 1; }
-  local current_port
-  current_port=$(get_port)
-  # Keep current port by default (don't force 443 — user may have 3x-ui or other on 443)
-  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_SSL_CA_TYPE=/d' "$ENV_FILE"
-  {
-    echo "UVICORN_SSL_CERTFILE=${dst}/fullchain.pem"
-    echo "UVICORN_SSL_KEYFILE=${dst}/privkey.pem"
-  } >> "$ENV_FILE"
-  # Only ensure UVICORN_PORT exists; do not override user's chosen port
-  if ! grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
-    echo "UVICORN_PORT=${current_port}" >> "$ENV_FILE"
-  fi
-  ufw allow "${current_port}/tcp" 2>/dev/null || true
-  echo -e "  ${GREEN}.env → SSL paths set (port kept: ${current_port})${NC}"
+  local domain="$1" dst="${DATA_DIR}/certs/${domain}"
+  [[ -f "${dst}/fullchain.pem" && -f "${dst}/privkey.pem" ]] || { err "Missing files in ${dst}"; return 1; }
+  [[ -f "$ENV_FILE" ]] || { err "No .env"; return 1; }
+  local cp; cp=$(get_port)
+  sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^UVICORN_SSL_CA_TYPE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d' "$ENV_FILE"
+  { echo "UVICORN_SSL_CERTFILE=${dst}/fullchain.pem"; echo "UVICORN_SSL_KEYFILE=${dst}/privkey.pem"; } >> "$ENV_FILE"
+  grep -q '^UVICORN_PORT=' "$ENV_FILE" || echo "UVICORN_PORT=${cp}" >> "$ENV_FILE"
+  ufw allow "${cp}/tcp" >/dev/null 2>&1 || true
+  ok ".env → SSL paths set (port kept: ${cp})"
 }
+cert_covers_domain(){ [[ -f "$1" ]] && openssl x509 -in "$1" -noout -text 2>/dev/null | grep -qE "DNS:${2}(,|$| )"; }
 
-cert_covers_domain(){
-  local pem="$1" domain="$2"
-  [[ -f "$pem" ]] || return 1
-  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -qE "DNS:${domain}(,|$| )" && return 0
-  openssl x509 -in "$pem" -noout -text 2>/dev/null | grep -q "DNS:${domain}" && return 0
-  return 1
+# After every certbot renewal: copy certs into panel dir + restart panel
+install_cert_hook(){
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/pg-m-copy.sh <<'HOOK'
+#!/bin/bash
+# installed by pg-m — copies renewed certs where the panel container can read them
+for d in /etc/letsencrypt/live/*/; do
+  n=$(basename "$d"); [[ "$n" == README ]] && continue
+  [[ -f "${d}fullchain.pem" ]] || continue
+  mkdir -p "/var/lib/pasarguard/certs/$n"
+  cp -L "${d}fullchain.pem" "${d}privkey.pem" "/var/lib/pasarguard/certs/$n/"
+  chmod 644 "/var/lib/pasarguard/certs/$n/fullchain.pem"; chmod 600 "/var/lib/pasarguard/certs/$n/privkey.pem"
+done
+if command -v pasarguard >/dev/null; then pasarguard restart >/dev/null 2>&1
+else docker compose --project-directory /opt/pasarguard -f /opt/pasarguard/docker-compose.yml restart >/dev/null 2>&1; fi
+HOOK
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/pg-m-copy.sh
+  ok "Renewal hook installed (certs auto-copied + panel restarted after renew)"
 }
 
 ssl_health(){
   echo -e "  ${BOLD}SSL Health Check${NC}"; hr
-  echo -e "  ${CYAN}[.env]${NC}"
-  local cert key port
-  cert=$(get_env UVICORN_SSL_CERTFILE)
-  key=$(get_env UVICORN_SSL_KEYFILE)
-  port=$(get_port)
-  echo "  CERTFILE = ${cert:-<empty>}"
-  echo "  KEYFILE  = ${key:-<empty>}"
-  echo "  PORT     = ${port}"
-  if [[ -z "$cert" || -z "$key" ]]; then
-    echo -e "  ${RED}SSL not set in .env${NC}"
-  elif [[ "$cert" == /etc/letsencrypt/* ]]; then
-    echo -e "  ${RED}BAD: .env points to /etc/letsencrypt (container cannot read it)${NC}"
+  local cert key port; cert=$(get_env UVICORN_SSL_CERTFILE); key=$(get_env UVICORN_SSL_KEYFILE); port=$(get_port)
+  echo "  CERTFILE = ${cert:-<empty>}"; echo "  KEYFILE  = ${key:-<empty>}"; echo "  PORT     = ${port}"
+  if [[ -z "$cert" || -z "$key" ]]; then err "SSL not set in .env"
+  elif [[ "$cert" == /etc/letsencrypt/* ]]; then err "BAD: .env points to /etc/letsencrypt (container cannot read it) → use option 4"
   elif [[ -f "$cert" && -f "$key" ]]; then
-    echo -e "  ${GREEN}Files exist on host${NC}"
-    echo -n "  Expiry: "; openssl x509 -in "$cert" -noout -enddate 2>/dev/null || true
-    echo "  SANs:"
-    openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/    /' || true
-  else
-    echo -e "  ${RED}Cert/key path missing on host${NC}"
-  fi
-  hr
-  echo -e "  ${CYAN}[Let's Encrypt live]${NC}"
-  if [[ -d /etc/letsencrypt/live ]]; then
-    for d in /etc/letsencrypt/live/*/; do
-      n=$(basename "$d"); [[ "$n" == README ]] && continue
-      [[ -f "${d}fullchain.pem" ]] || continue
-      echo -n "  • $n  "
-      if openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" 2>/dev/null; then echo -e "${GREEN}valid${NC}"; else echo -e "${RED}expired${NC}"; fi
-      openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/^/      /'
-    done
-  else
-    echo "  (none)"
-  fi
-  hr
-  echo -e "  ${CYAN}[Panel data certs]${NC}"
-  ls -la "${DATA_DIR}/certs/" 2>/dev/null || echo "  (empty)"
-  hr
-  echo -e "  ${CYAN}[Listen + local HTTPS]${NC}"
-  ss -tlnp | grep -E ':443|:8000' || echo "  nothing on 443/8000"
-  curl -sI --max-time 5 -k "https://127.0.0.1/dashboard/" 2>/dev/null | head -2 || echo "  local HTTPS failed"
-  hr
-  echo -e "  ${CYAN}[SNI test panel vs subs]${NC}"
-  for host in panel.nexus-net.online subs.nexus-net.online; do
+    ok "Files exist on host"
+    echo -n "  Expiry: "; openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2
+    echo "  SANs: $(openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
+  else err "Cert/key path missing on host"; fi
+  hr; echo -e "  ${CYAN}[Let's Encrypt live]${NC}"; list_certs
+  echo -e "  ${CYAN}[Local HTTPS test]${NC}"
+  echo -n "  https://127.0.0.1:${port}/dashboard/ → "
+  curl -sk --max-time 5 -o /dev/null -w '%{http_code}\n' "https://127.0.0.1:${port}/dashboard/" 2>/dev/null || echo fail
+  hr; echo -e "  ${CYAN}[SNI test per domain]${NC}"
+  local host
+  for host in $(collect_domains); do
     echo -n "  $host → "
-    echo | openssl s_client -connect 127.0.0.1:443 -servername "$host" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "fail"
+    echo | timeout 6 openssl s_client -connect 127.0.0.1:"${port}" -servername "$host" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "no TLS answer"
   done
   hr
 }
@@ -429,7 +987,7 @@ m_ssl(){
     echo -e "  ${BOLD}4. SSL Certificate Management${NC}"; hr
     echo "  1. SSL health check / debug"
     echo "  2. List Let's Encrypt certs"
-    echo "  3. Issue cert (domain) + apply"
+    echo "  3. Issue cert (domain / sub-domains) + apply"
     echo "  4. Fix paths (copy LE → panel + .env)"
     echo "  5. Renew all + re-copy to panel"
     echo "  6. Delete / revoke certificate"
@@ -437,457 +995,417 @@ m_ssl(){
     echo "  8. Show .env SSL lines"
     echo "  9. Edit .env"
     echo " 10. Restart panel"
+    echo " 11. Install auto-renew hook (recommended)"
+    echo " 12. DNS check of all certificate domains"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
       1) ssl_health; pause ;;
       2) list_certs; pause ;;
       3)
-        echo "  Examples:"
-        echo "    panel.example.com"
-        echo "    panel.example.com subs.example.com   (multi-domain / SAN)"
+        echo "  Examples:"; echo "    panel.example.com"; echo "    panel.example.com subs.example.com   (one cert, several names)"
         read -rp "  Domain(s): " domains
         [[ -z "$domains" ]] && continue
-        primary=$(echo "$domains" | awk '{print $1}')
-        # If all domains already covered by one valid cert, only fix paths
+        primary=$(awk '{print $1}' <<<"$domains")
+        bad=0; for host in $domains; do
+          r=$(dns_resolve "$host")
+          if [[ "$r" != "$(get_ip)" ]]; then warn "$host resolves to '${r:-nothing}' but this server is $(get_ip)"; bad=1; fi
+        done
+        [[ $bad -eq 1 ]] && ! confirm "DNS does not match — Let's Encrypt will probably fail. Continue?" n && continue
         all_ok=1
         for host in $domains; do
           found=0
-          for d in /etc/letsencrypt/live/*/; do
-            [[ -f "${d}fullchain.pem" ]] || continue
-            if cert_covers_domain "${d}fullchain.pem" "$host"; then found=1; break; fi
-          done
+          for d in /etc/letsencrypt/live/*/; do [[ -f "${d}fullchain.pem" ]] && cert_covers_domain "${d}fullchain.pem" "$host" && { found=1; break; }; done
           [[ $found -eq 1 ]] || all_ok=0
         done
         if [[ $all_ok -eq 1 ]]; then
-          echo -e "  ${GREEN}Valid cert already covers: ${domains}${NC}"
-          echo "  Skipping certbot. Fixing panel paths only..."
-          copy_cert_to_panel "$primary"
-          apply_cert_env "$primary"
-          # also copy under each name for clarity
+          ok "A valid cert already covers: ${domains} — fixing panel paths only"
           for host in $domains; do copy_cert_to_panel "$host" 2>/dev/null || true; done
-          pasarguard restart
-          ssl_health
-          pause
-          continue
+          apply_cert_env "$primary"; install_cert_hook; pasarguard restart; ssl_health; pause; continue
         fi
-        apt install -y certbot >/dev/null 2>&1 || true
-        ufw allow 80/tcp 2>/dev/null || true
-        free_port_80 || { echo -e "  ${RED}Port 80 busy${NC}"; pause; continue; }
-        cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email)
+        apt-get install -y -qq certbot >/dev/null 2>&1 || true
+        ufw allow 80/tcp >/dev/null 2>&1 || true
+        free_port_80 || { pause; continue; }
+        cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$primary")
         for host in $domains; do cb+=(-d "$host"); done
-        "${cb[@]}" || certbot certonly --standalone $(for host in $domains; do echo -n " -d $host"; done)
-        has_pg && pasarguard up 2>/dev/null || true
-        if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]] || ls /etc/letsencrypt/live/*/fullchain.pem >/dev/null 2>&1; then
+        "${cb[@]}"
+        has_pg && pasarguard up >/dev/null 2>&1 || true
+        if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]]; then
           for host in $domains; do copy_cert_to_panel "$host" || true; done
-          apply_cert_env "$primary"
-          pasarguard restart
-          ssl_health
-        else
-          echo -e "  ${RED}certbot failed${NC}"
-          has_pg && pasarguard up 2>/dev/null || true
-        fi
-        pause
-        ;;
+          copy_cert_to_panel "$primary"
+          apply_cert_env "$primary"; install_cert_hook; pasarguard restart; ssl_health
+        else err "certbot failed (check DNS + port 80 from the internet)"; fi
+        pause ;;
       4)
-        read -rp "  Primary domain (used in .env, e.g. panel.nexus-net.online): " primary
+        ask "Primary domain (used in .env)" primary ""
         [[ -z "$primary" ]] && continue
         copy_cert_to_panel "$primary" && apply_cert_env "$primary"
-        read -rp "  Extra domain names to copy folders for (optional, space-separated): " extras
+        ask "Extra domain folders to create (space-separated, optional)" extras ""
         for host in $extras; do copy_cert_to_panel "$host" || true; done
-        pasarguard restart
-        ssl_health
-        pause
-        ;;
+        pasarguard restart; ssl_health; pause ;;
       5)
         certbot renew
-        for d in /etc/letsencrypt/live/*/; do
-          n=$(basename "$d"); [[ "$n" == README ]] && continue
-          copy_cert_to_panel "$n" || true
-        done
-        echo -e "  ${YELLOW}Restart panel to load renewed files?${NC}"
-        read -rp "  yes/no: " r
-        [[ "$r" == yes ]] && pasarguard restart
-        ssl_health
-        pause
-        ;;
+        for d in /etc/letsencrypt/live/*/; do n=$(basename "$d"); [[ "$n" == README ]] && continue; copy_cert_to_panel "$n" || true; done
+        confirm "Restart panel to load renewed files?" y && pasarguard restart
+        ssl_health; pause ;;
       6)
-        list_certs
-        read -rp "  Domain to delete: " domain
+        list_certs; ask "Domain (cert name) to delete" domain ""
         [[ -z "$domain" ]] && continue
-        read -rp "  Type yes: " c
-        if [[ "$c" == yes ]]; then
-          certbot revoke --cert-path "/etc/letsencrypt/live/${domain}/fullchain.pem" --non-interactive 2>/dev/null || true
-          certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || \
-            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
-          rm -rf "${DATA_DIR}/certs/${domain}" 2>/dev/null || true
-          echo -e "  ${GREEN}Removed ${domain}${NC}"
+        if confirm_yes "Delete ${domain}"; then
+          certbot revoke --cert-path "/etc/letsencrypt/live/${domain}/fullchain.pem" --non-interactive >/dev/null 2>&1 || true
+          certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || \
+            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null
+          rm -rf "${DATA_DIR}/certs/${domain}" 2>/dev/null
+          ok "Removed ${domain}"
         fi
-        pause
-        ;;
+        pause ;;
       7)
-        read -rp "  CN: " cn
+        ask "CN (domain or IP)" cn ""
         mkdir -p "${DATA_DIR}/certs"
-        openssl req -x509 -newkey rsa:4096 -keyout "${DATA_DIR}/certs/key.pem" \
-          -out "${DATA_DIR}/certs/cert.pem" -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
-        echo "  ${DATA_DIR}/certs/cert.pem"; pause
-        ;;
+        openssl req -x509 -newkey rsa:4096 -keyout "${DATA_DIR}/certs/key.pem" -out "${DATA_DIR}/certs/cert.pem" -days 36500 -nodes -subj "/CN=${cn}" 2>/dev/null
+        chmod 600 "${DATA_DIR}/certs/key.pem"
+        echo "  ${DATA_DIR}/certs/cert.pem"
+        if confirm "Apply to panel (.env) now?" n; then
+          sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d' "$ENV_FILE"
+          { echo "UVICORN_SSL_CERTFILE=${DATA_DIR}/certs/cert.pem"; echo "UVICORN_SSL_KEYFILE=${DATA_DIR}/certs/key.pem"; } >> "$ENV_FILE"
+          pasarguard restart
+        fi
+        pause ;;
       8) grep -E 'SSL|UVICORN|CERT|KEY|PORT' "$ENV_FILE" 2>/dev/null || echo none; pause ;;
       9) pasarguard edit-env ;;
       10) pasarguard restart; pause ;;
+      11) install_cert_hook; systemctl enable --now certbot.timer >/dev/null 2>&1 || true; pause ;;
+      12) dns_report; pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── 4 Backup ───────────────────
-m_backup(){
-  while true; do
-    header
-    echo -e "  ${BOLD}5. Backup & Restore${NC}"; hr
-    echo "  1. Manual backup"
-    echo "  2. Telegram auto-backup"
-    echo "  3. Restore"
-    echo "  4. List files"
-    echo "  5. Paths"
-    echo "  6. PostgreSQL dump"
-    echo "  0. Back"; hr
-    read -rp "  Select: " o
-    case $o in
-      1) pasarguard backup; pause ;;
-      2) pasarguard backup-service; pause ;;
-      3) pasarguard restore; pause ;;
-      4) ls -lh "$BACKUP_DIR" 2>/dev/null || echo "  empty"; pause ;;
-      5) echo "  $BACKUP_DIR"; echo "  $APP_DIR"; echo "  $DATA_DIR"; pause ;;
-      6)
-        OUT=~/pg-$(date +%F-%H%M).dump
-        C=$(docker ps -qf name=postgresql | head -1)
-        if [[ -n "$C" ]]; then
-          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
-          docker cp "$C":/tmp/pg.dump "$OUT"
-          echo -e "  ${GREEN}$OUT${NC}"
-        else echo "  no container"; fi
-        pause
-        ;;
-      0) break ;;
-    esac
-  done
+# ═════════════════ Migration (new VPS) ═════════════════
+MIG_SSH_BASE=(); MIG_SSH=(); MIG_SCP=(); MIG_TARGET=""; MIG_SCPTARGET=""; MIG_FROZEN=0
+mig_setup_conn(){   # needs NEW_IP NEW_PORT NEW_USER AUTH_METHOD KEY_PATH
+  local ctl="/tmp/pgm-ssh-$$-%C" pre=() common
+  common=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=20 -o ControlMaster=auto -o "ControlPath=$ctl" -o ControlPersist=900)
+  if [[ "$AUTH_METHOD" == 2 ]]; then common+=(-i "$KEY_PATH"); else pre=(sshpass -e); fi
+  MIG_TARGET="${NEW_USER}@${NEW_IP}"
+  if [[ "$NEW_IP" == *:* ]]; then MIG_SCPTARGET="${NEW_USER}@[${NEW_IP}]"; else MIG_SCPTARGET="$MIG_TARGET"; fi
+  MIG_SSH_BASE=("${pre[@]}" ssh "${common[@]}" -p "$NEW_PORT")
+  MIG_SSH=("${MIG_SSH_BASE[@]}" "$MIG_TARGET")
+  MIG_SCP=("${pre[@]}" scp "${common[@]}" -P "$NEW_PORT")
+}
+mig_rsh(){ "${MIG_SSH[@]}" "$@"; }
+mig_close(){ [[ ${#MIG_SSH_BASE[@]} -gt 0 ]] && "${MIG_SSH_BASE[@]}" -O exit "$MIG_TARGET" >/dev/null 2>&1; unset SSHPASS; return 0; }
+mig_fail(){
+  err "$1"
+  if [[ $MIG_FROZEN -eq 1 ]]; then warn "Restarting the old panel (migration aborted)"; dc start "$(app_svc)" >/dev/null 2>&1; MIG_FROZEN=0; fi
+  mig_close; pause; return 1
 }
 
-# ─────────────────── 5 Migrate ───────────────────
+migrate_auto(){
+  header
+  echo -e "  ${BOLD}Full Auto Migration → New VPS${NC}"; hr
+  [[ -f "$COMPOSE_FILE" ]] || { err "No local panel found ($COMPOSE_FILE)"; pause; return 1; }
+  echo -e "  ${YELLOW}What happens:${NC}"
+  echo "   1. Checks SSH + the new server (OS, disk, Docker, existing panel)"
+  echo "   2. Builds ONE package: DB dump + .env + compose + panel data + all"
+  echo "      certificates (panel & sub-domains) + nginx + cron + Telegram settings"
+  echo "   3. Uploads it (checksum verified), installs Docker / panel CLI there"
+  echo "   4. Restores everything, starts the panel, compares user/admin/node counts"
+  echo "   5. Checks DNS for every domain (and can switch Cloudflare A-records)"
+  hr
+  ask "New server IP / hostname" NEW_IP ""
+  [[ -z "$NEW_IP" ]] && { err "IP required"; pause; return 1; }
+  if [[ "$NEW_IP" == "$(get_ip)" ]]; then err "That is THIS server"; pause; return 1; fi
+  ask "SSH port" NEW_PORT 22
+  ask "SSH user" NEW_USER root
+  [[ "$NEW_USER" != root ]] && warn "Non-root user: restore needs root privileges — use root."
+  echo "  Authentication:"; echo "   1. Password"; echo "   2. SSH key file"
+  ask "Select" AUTH_METHOD 1
+  KEY_PATH=""
+  if [[ "$AUTH_METHOD" == 2 ]]; then
+    ask "Path to private key" KEY_PATH ""
+    [[ -f "$KEY_PATH" ]] || { err "Key not found"; pause; return 1; }
+  else
+    has_cmd sshpass || { info "Installing sshpass..."; apt-get update -qq; apt-get install -y -qq sshpass >/dev/null 2>&1 || { err "sshpass install failed — use key auth"; pause; return 1; }; }
+    read -rsp "  SSH password: " NEW_PASS; echo; export SSHPASS="$NEW_PASS"
+  fi
+  has_cmd ssh || apt-get install -y -qq openssh-client >/dev/null 2>&1
+  mig_setup_conn
+
+  info "Testing SSH connection..."
+  local pf; pf=$(mig_rsh 'echo "PGM_OK"; echo "UID=$(id -u)"; . /etc/os-release 2>/dev/null; echo "OS=${PRETTY_NAME:-unknown}"; echo "ARCH=$(uname -m)"; echo "FREE_MB=$(df -Pm / | awk "NR==2{print \$4}")"; echo "MEM_MB=$(free -m | awk "/Mem:/{print \$2}")"; echo "DOCKER=$(command -v docker >/dev/null && echo yes || echo no)"; echo "PANEL=$([ -f /opt/pasarguard/docker-compose.yml ] && echo yes || echo no)"' 2>/tmp/pgm-ssh.err)
+  grep -q PGM_OK <<<"$pf" || { cat /tmp/pgm-ssh.err 2>/dev/null | tail -3; mig_fail "SSH connection failed"; return 1; }
+  ok "Connected to ${MIG_TARGET}"
+  local r_uid r_os r_arch r_free r_mem r_docker r_panel
+  r_uid=$(grep ^UID= <<<"$pf" | cut -d= -f2); r_os=$(grep ^OS= <<<"$pf" | cut -d= -f2-); r_arch=$(grep ^ARCH= <<<"$pf" | cut -d= -f2)
+  r_free=$(grep ^FREE_MB= <<<"$pf" | cut -d= -f2); r_mem=$(grep ^MEM_MB= <<<"$pf" | cut -d= -f2)
+  r_docker=$(grep ^DOCKER= <<<"$pf" | cut -d= -f2); r_panel=$(grep ^PANEL= <<<"$pf" | cut -d= -f2)
+  echo "    OS     : $r_os ($r_arch)"; echo "    Free   : ${r_free} MB   RAM: ${r_mem} MB"
+  echo "    Docker : $r_docker     Existing panel: $r_panel"
+  [[ "$r_uid" != 0 ]] && { mig_fail "Remote user is not root"; return 1; }
+  [[ "$r_arch" != "$(uname -m)" ]] && warn "CPU architecture differs ($(uname -m) → $r_arch) — images must support it"
+  [[ "${r_mem:-0}" -lt 900 ]] && warn "New server has < 1GB RAM — consider adding swap (pg-m → Tools)"
+  if [[ "$r_panel" == yes ]]; then
+    warn "A PasarGuard panel ALREADY exists on the new server — it will be replaced (a safety snapshot is made there first)."
+  fi
+
+  local freeze=n
+  if confirm "Stop the OLD panel while packaging so no data changes (recommended)?" y; then freeze=y; fi
+  confirm_yes "Start migration to ${NEW_IP}" || { mig_close; echo "  Cancelled"; pause; return 1; }
+
+  if [[ "$freeze" == y ]]; then
+    info "Stopping old panel app (database stays up)..."
+    dc stop "$(app_svc)" >/dev/null 2>&1 && MIG_FROZEN=1
+  fi
+
+  info "Building migration package..."
+  create_backup full migrate || { mig_fail "Backup failed — nothing was changed on the new server"; return 1; }
+  local ARC="$BACKUP_RESULT" ARCN; ARCN=$(basename "$ARC")
+  local need=$(( $(stat -c %s "$ARC") / 1048576 * 3 + 500 ))
+  [[ "${r_free:-0}" -lt "$need" ]] && { mig_fail "Not enough disk on new server (need ~${need} MB, have ${r_free} MB)"; return 1; }
+
+  info "Preparing new server (curl, tar, openssl)..."
+  mig_rsh 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /root/pg-m-incoming && chmod 700 /root/pg-m-incoming; command -v apt-get >/dev/null && { apt-get update -qq; apt-get install -y -qq curl ca-certificates tar gzip openssl >/dev/null 2>&1; }; true' >/dev/null 2>&1
+
+  local SELF; SELF=$(readlink -f "$0" 2>/dev/null); [[ -f "$SELF" ]] || SELF="$INSTALL_PATH"
+  info "Uploading package ($(du -h "$ARC" | cut -f1))..."
+  local try ok_up=0
+  for try in 1 2 3; do
+    if "${MIG_SCP[@]}" "$ARC" "$ARC.sha256" "$SELF" "${MIG_SCPTARGET}:/root/pg-m-incoming/"; then ok_up=1; break; fi
+    warn "Upload attempt $try failed — retrying..."; sleep 3
+  done
+  [[ $ok_up -eq 1 ]] || { mig_fail "Upload failed"; return 1; }
+  mig_rsh "cd /root/pg-m-incoming && mv -f $(basename "$SELF") pg-m 2>/dev/null; chmod +x pg-m; sha256sum -c ${ARCN}.sha256" >/dev/null 2>&1 \
+    && ok "Upload verified (sha256)" || { mig_fail "Checksum mismatch after upload"; return 1; }
+
+  info "Running restore on the new server (this can take several minutes)..."
+  hr
+  mig_rsh "bash /root/pg-m-incoming/pg-m --restore-archive /root/pg-m-incoming/${ARCN} --auto"
+  local rrc=$?
+  hr
+  if [[ $rrc -ne 0 ]]; then
+    warn "Restore on the new server reported problems (exit $rrc)."
+    warn "Log in there and run: pg-m → Quick Status / Doctor, or: docker compose -f /opt/pasarguard/docker-compose.yml logs"
+  else ok "Restore finished successfully on ${NEW_IP}"; fi
+
+  # external reachability test
+  local code scheme port; scheme=$(panel_scheme); port=$(get_port)
+  code=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "${scheme}://${NEW_IP}:${port}/dashboard/" 2>/dev/null)
+  if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then ok "Panel reachable from here: ${scheme}://${NEW_IP}:${port}/dashboard/ (HTTP $code)"
+  else warn "Panel not reachable from outside on port ${port} (firewall / provider security group?)"; fi
+
+  echo; echo -e "  ${BOLD}DNS status (domains found in your certificates)${NC}"; hr
+  dns_report "$NEW_IP"
+  if [[ -n "$(collect_domains)" ]]; then
+    if cf_have; then
+      confirm "Cloudflare token found — switch ALL these A-records to ${NEW_IP} now?" n && cf_point_domains "$NEW_IP"
+    else
+      echo -e "  ${DIM}Tip: add a Cloudflare token in menu 13 to switch DNS automatically.${NC}"
+      echo "  Otherwise change the A-records manually to: ${NEW_IP}"
+    fi
+  fi
+
+  if [[ $rrc -eq 0 && $MIG_FROZEN -eq 1 ]]; then
+    echo
+    if confirm "Keep the OLD panel stopped (avoids two panels fighting over nodes/users)?" y; then
+      ok "Old panel stays stopped. Start it again any time: pasarguard up"
+      conf_set MIGRATED_TO "$NEW_IP"
+    else
+      dc start "$(app_svc)" >/dev/null 2>&1; warn "Old panel restarted — remember to stop one of the two!"
+    fi
+    MIG_FROZEN=0
+  elif [[ $MIG_FROZEN -eq 1 ]]; then
+    warn "Because the restore had problems, restarting the old panel."
+    dc start "$(app_svc)" >/dev/null 2>&1; MIG_FROZEN=0
+  fi
+
+  if confirm "Delete the migration package from the NEW server (contains private keys)?" y; then
+    mig_rsh "rm -rf /root/pg-m-incoming" >/dev/null 2>&1 && ok "Removed from new server"
+  fi
+  mig_close
+  echo
+  echo -e "  ${GREEN}════════════════════════════════════════════════${NC}"
+  echo -e "  ${BOLD}Post-migration checklist${NC}"
+  echo "   ☐ DNS A-records of panel / sub domains → ${NEW_IP}"
+  echo "   ☐ Log in to the new panel and check users / nodes"
+  echo "   ☐ Nodes: allow the NEW panel IP in node firewalls (pg-m → Node → Lock API port)"
+  echo "   ☐ Keep the package: ${ARC}"
+  echo -e "  ${GREEN}════════════════════════════════════════════════${NC}"
+  log "migration to $NEW_IP finished rc=$rrc"
+  pause
+}
+
 m_migrate(){
   while true; do
     header
     echo -e "  ${BOLD}6. Migrate to New Server${NC}"; hr
-    echo "  1. Create migration package only"
-    echo "  2. Full Auto Transfer (package + upload + remote install + restore)"
-    echo "  3. Help / How it works"
+    echo "  1. Full Auto Transfer  (package + upload + install + restore + DNS)"
+    echo "  2. Create migration package only"
+    echo "  3. Restore a package on THIS server  (use on the new VPS)"
+    echo "  4. Pre-migration check of this server"
+    echo "  5. Help / How it works"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1)
-        header
-        echo -e "  ${BOLD}Creating migration package...${NC}"; hr
-        DIR=~/pg-migrate-$(date +%F-%H%M)
-        mkdir -p "$DIR"
-        echo -e "  ${CYAN}→ Running official backup...${NC}"
-        pasarguard backup 2>/dev/null || true
-        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
-        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
-        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
-        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
-        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
-        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
-        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
-        rm -rf "$DIR"
-        echo -e "  ${GREEN}Package created:${NC}"
-        echo -e "  ${CYAN}$ARC${NC}"
-        ls -lh "$ARC" 2>/dev/null || true
-        echo
-        echo "  Next steps on new server:"
-        echo "  1. Upload this file"
-        echo "  2. Install panel + pg-m"
-        echo "  3. Extract and restore"
-        pause
-        ;;
+      1) migrate_auto ;;
       2)
-        header
-        echo -e "  ${BOLD}Full Auto Transfer to New VPS${NC}"; hr
-        echo -e "  ${YELLOW}This will:${NC}"
-        echo "  • Create full migration package"
-        echo "  • Upload it to the new server via SSH/SCP"
-        echo "  • Install pg-m on the new server"
-        echo "  • Install PasarGuard panel (if missing)"
-        echo "  • Restore backup + apply certs + restart"
-        echo
-        read -rp "  New server IP: " NEW_IP
-        [[ -z "$NEW_IP" ]] && { echo -e "  ${RED}IP required${NC}"; pause; continue; }
-        read -rp "  SSH Port [22]: " NEW_PORT
-        NEW_PORT=${NEW_PORT:-22}
-        read -rp "  SSH User [root]: " NEW_USER
-        NEW_USER=${NEW_USER:-root}
-        echo
-        echo -e "  ${CYAN}Authentication method:${NC}"
-        echo "  1. Password"
-        echo "  2. SSH Key (path to private key)"
-        read -rp "  Select [1]: " AUTH_METHOD
-        AUTH_METHOD=${AUTH_METHOD:-1}
-
-        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $NEW_PORT"
-        SCP_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -P $NEW_PORT"
-
-        if [[ "$AUTH_METHOD" == "2" ]]; then
-          read -rp "  Path to private key: " KEY_PATH
-          [[ ! -f "$KEY_PATH" ]] && { echo -e "  ${RED}Key not found${NC}"; pause; continue; }
-          SSH_OPTS="$SSH_OPTS -i $KEY_PATH"
-          SCP_OPTS="$SCP_OPTS -i $KEY_PATH"
-        else
-          if ! command -v sshpass &>/dev/null; then
-            echo -e "  ${YELLOW}Installing sshpass...${NC}"
-            apt-get update -qq && apt-get install -y -qq sshpass >/dev/null 2>&1 || {
-              echo -e "  ${RED}Could not install sshpass. Use SSH key method instead.${NC}"
-              pause; continue
-            }
-          fi
-          read -rsp "  Root password: " NEW_PASS
-          echo
-          export SSHPASS="$NEW_PASS"
+        header; echo -e "  ${BOLD}Creating migration package...${NC}"; hr
+        if create_backup full migrate; then
+          echo; echo "  Copy it to the new server, e.g.:"
+          echo -e "    ${CYAN}scp ${BACKUP_RESULT} ${BACKUP_RESULT}.sha256 root@NEW_IP:/root/${NC}"
+          echo "  Then on the new server:  install pg-m  →  pg-m → Migrate → 3  (or: pg-m --restore-archive FILE)"
         fi
-
-        echo -e "  ${CYAN}→ Testing SSH connection...${NC}"
-        if [[ "$AUTH_METHOD" == "2" ]]; then
-          if ! ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
-            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
-          fi
-        else
-          if ! sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "echo ok" &>/dev/null; then
-            echo -e "  ${RED}SSH connection failed${NC}"; pause; continue
-          fi
-        fi
-        echo -e "  ${GREEN}Connected successfully${NC}"
-
-        echo -e "  ${CYAN}→ Creating migration package...${NC}"
-        DIR=~/pg-migrate-$(date +%F-%H%M)
-        mkdir -p "$DIR"
-        pasarguard backup 2>/dev/null || true
-        cp -a "$BACKUP_DIR"/* "$DIR/" 2>/dev/null || true
-        [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$DIR/env.backup"
-        cp -a /var/lib/pasarguard/certs "$DIR/" 2>/dev/null || true
-        cp -a /etc/letsencrypt "$DIR/letsencrypt" 2>/dev/null || true
-        cp -a /usr/local/bin/pg-m "$DIR/pg-m" 2>/dev/null || true
-        DB_TYPE=$(get_env DATABASE_TYPE 2>/dev/null || echo "timescaledb")
-        echo "$DB_TYPE" > "$DIR/db_type.txt"
-        ARC=~/pg-migrate-$(date +%F-%H%M).tar.gz
-        tar -czf "$ARC" -C ~ "$(basename "$DIR")" 2>/dev/null
-        rm -rf "$DIR"
-        echo -e "  ${GREEN}Package ready: $(basename "$ARC")${NC}"
-
-        echo -e "  ${CYAN}→ Uploading package to new server...${NC}"
-        if [[ "$AUTH_METHOD" == "2" ]]; then
-          scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
-            echo -e "  ${RED}Upload failed${NC}"; pause; continue
-          }
-        else
-          sshpass -e scp $SCP_OPTS "$ARC" "${NEW_USER}@${NEW_IP}:/root/" || {
-            echo -e "  ${RED}Upload failed${NC}"; pause; continue
-          }
-        fi
-        echo -e "  ${GREEN}Upload complete${NC}"
-
-        REMOTE_SCRIPT='#!/bin/bash
-set -e
-ARC=$(ls -1t /root/pg-migrate-*.tar.gz 2>/dev/null | head -1)
-if [[ -z "$ARC" ]]; then
-  echo "ERROR: No migration package found in /root"
-  exit 1
-fi
-echo "→ Found package: $ARC"
-cd /root
-tar -xzf "$ARC"
-MIG_DIR=$(ls -d pg-migrate-* | head -1)
-echo "→ Extracted to $MIG_DIR"
-
-if [[ -f "$MIG_DIR/pg-m" ]]; then
-  cp "$MIG_DIR/pg-m" /usr/local/bin/pg-m
-  chmod +x /usr/local/bin/pg-m
-  echo "→ pg-m installed"
-fi
-
-# ═══ AGGRESSIVE CLEAN (fixes "directory exists but is not empty") ═══
-echo "→ Stopping all PasarGuard related containers..."
-command -v pasarguard >/dev/null && pasarguard down 2>/dev/null || true
-docker rm -f $(docker ps -aq --filter name=pasarguard) 2>/dev/null || true
-docker rm -f $(docker ps -aq --filter name=timescale) 2>/dev/null || true
-docker rm -f $(docker ps -aq --filter name=postgres) 2>/dev/null || true
-docker rm -f $(docker ps -aq --filter name=pgbouncer) 2>/dev/null || true
-docker rm -f $(docker ps -aq --filter name=pgadmin) 2>/dev/null || true
-
-echo "→ Removing docker volumes..."
-docker volume rm $(docker volume ls -q | grep -E "pasarguard|pgadmin|timescale") 2>/dev/null || true
-
-echo "→ Cleaning database data directories..."
-rm -rf /var/lib/postgresql/pasarguard
-rm -rf /var/lib/postgresql/*
-rm -rf /var/lib/mysql/pasarguard 2>/dev/null || true
-rm -rf /opt/pasarguard /var/lib/pasarguard 2>/dev/null || true
-
-echo "→ Clean complete"
-
-if ! command -v pasarguard &>/dev/null; then
-  echo "→ Installing PasarGuard panel..."
-  DB_TYPE=$(cat "$MIG_DIR/db_type.txt" 2>/dev/null || echo "timescaledb")
-  case "$DB_TYPE" in
-    mysql|mariadb|postgresql|sqlite) ;;
-    *) DB_TYPE="timescaledb" ;;
-  esac
-  bash -c "$(curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh)" @ install --database "$DB_TYPE" --no-ssl || true
-fi
-
-# ═══ FIX WRONG PGDATA / VOLUME MOUNT (common migration bug) ═══
-COMPOSE="/opt/pasarguard/docker-compose.yml"
-if [[ -f "$COMPOSE" ]]; then
-  # Fix Timescale/Postgres mount path to official recommended
-  if grep -q "/var/lib/postgresql/pasarguard:/var/lib/postgresql\"" "$COMPOSE" 2>/dev/null || \
-     grep -q "/var/lib/postgresql/pasarguard:/var/lib/postgresql$" "$COMPOSE" 2>/dev/null; then
-    echo "→ Fixing incorrect PostgreSQL volume mount..."
-    sed -i "s|/var/lib/postgresql/pasarguard:/var/lib/postgresql|/var/lib/postgresql/pasarguard:/var/lib/postgresql/data|g" "$COMPOSE"
-  fi
-  if grep -q "PGDATA: /var/lib/postgresql$" "$COMPOSE" 2>/dev/null; then
-    sed -i "s|PGDATA: /var/lib/postgresql|PGDATA: /var/lib/postgresql/data|g" "$COMPOSE"
-  fi
-  echo "→ Compose volume paths checked/fixed"
-fi
-
-# Restore certs BEFORE applying .env so paths exist
-if [[ -d "$MIG_DIR/certs" ]]; then
-  mkdir -p /var/lib/pasarguard
-  cp -a "$MIG_DIR/certs" /var/lib/pasarguard/
-  echo "→ Panel certs restored"
-fi
-if [[ -d "$MIG_DIR/letsencrypt" ]]; then
-  cp -a "$MIG_DIR/letsencrypt" /etc/
-  echo "→ Let'\''s Encrypt certs restored"
-  for d in /etc/letsencrypt/live/*/; do
-    [[ -d "$d" ]] || continue
-    name=$(basename "$d")
-    [[ "$name" == "README" ]] && continue
-    mkdir -p "/var/lib/pasarguard/certs/${name}"
-    cp -L "${d}fullchain.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
-    cp -L "${d}privkey.pem" "/var/lib/pasarguard/certs/${name}/" 2>/dev/null || true
-  done
-  echo "→ LE certs copied to panel path"
-fi
-
-# Restore .env
-if [[ -f "$MIG_DIR/env.backup" ]]; then
-  mkdir -p /opt/pasarguard
-  cp "$MIG_DIR/env.backup" /opt/pasarguard/.env
-  echo "→ .env restored from backup"
-fi
-
-# Detect first available panel cert
-FOUND_CERT=""; FOUND_KEY=""; FOUND_DOMAIN=""
-if [[ -d /var/lib/pasarguard/certs ]]; then
-  for d in /var/lib/pasarguard/certs/*/ ; do
-    [[ -d "$d" ]] || continue
-    if [[ -f "${d}fullchain.pem" && -f "${d}privkey.pem" ]]; then
-      FOUND_CERT="${d}fullchain.pem"
-      FOUND_KEY="${d}privkey.pem"
-      FOUND_DOMAIN=$(basename "$d")
-      break
-    fi
-  done
-fi
-
-if [[ -f /opt/pasarguard/.env ]]; then
-  # Only strip SSL lines; keep existing UVICORN_PORT from backup
-  sed -i "/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d" /opt/pasarguard/.env
-fi
-
-if [[ -n "$FOUND_CERT" && -f "$FOUND_CERT" && -f "$FOUND_KEY" ]]; then
-  echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> /opt/pasarguard/.env
-  echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> /opt/pasarguard/.env
-  echo "→ SSL applied (domain: ${FOUND_DOMAIN}) — port left as in .env backup"
-else
-  if ! grep -q '^UVICORN_PORT=' /opt/pasarguard/.env 2>/dev/null; then
-    echo "UVICORN_PORT=8000" >> /opt/pasarguard/.env
-  fi
-  echo "→ No valid cert — using existing/default port"
-fi
-
-# Copy backup files for later restore
-if command -v pasarguard &>/dev/null; then
-  mkdir -p /opt/pasarguard/backup
-  cp -a "$MIG_DIR"/* /opt/pasarguard/backup/ 2>/dev/null || true
-  ZIP=$(ls -1t /opt/pasarguard/backup/backup_*.zip 2>/dev/null | head -1)
-  if [[ -n "$ZIP" ]]; then
-    echo "→ Backup zip ready: $ZIP"
-    echo "→ Run after panel is healthy:  pasarguard restore"
-  fi
-fi
-
-# Final up
-if command -v pasarguard &>/dev/null; then
-  # ensure data dir empty before first start
-  rm -rf /var/lib/postgresql/pasarguard/* 2>/dev/null || true
-  pasarguard up || true
-  sleep 3
-  pasarguard restart || true
-  echo "→ Panel restarted"
-fi
-
-echo ""
-echo "════════════════════════════════════════"
-echo "  Migration finished on this server"
-echo "  1) Run:  pg-m"
-echo "  2) If data missing: pasarguard restore"
-echo "  3) Re-issue SSL after DNS points here"
-echo "════════════════════════════════════════"
-'
-
-        echo -e "  ${CYAN}→ Running remote installation & restore...${NC}"
-        if [[ "$AUTH_METHOD" == "2" ]]; then
-          ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
-        else
-          sshpass -e ssh $SSH_OPTS "${NEW_USER}@${NEW_IP}" "bash -s" <<< "$REMOTE_SCRIPT"
-        fi
-
-        echo
-        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
-        echo -e "  ${GREEN}  Full transfer completed!${NC}"
-        echo -e "  ${GREEN}════════════════════════════════════════${NC}"
-        echo
-        echo -e "  New server: ${CYAN}${NEW_IP}${NC}"
-        echo -e "  Login and run:  ${CYAN}pg-m${NC}"
-        echo
-        pause
-        ;;
+        pause ;;
       3)
-        header
-        echo -e "  ${BOLD}How Full Auto Transfer works${NC}"; hr
-        echo "  1. Creates a complete package on current server"
-        echo "     (official backup + .env + certs + letsencrypt + pg-m)"
-        echo "  2. Connects to new VPS via SSH (password or key)"
-        echo "  3. Uploads the package"
-        echo "  4. On new server automatically:"
-        echo "     • Installs pg-m"
-        echo "     • Installs PasarGuard panel (same DB type)"
-        echo "     • Restores backup"
-        echo "     • Applies .env and certificates"
-        echo "     • Restarts services"
+        header; echo -e "  ${BOLD}Restore a pg-m package here${NC}"; hr
+        pick_backup && restore_archive "$PICKED"
+        pause ;;
+      4) doctor; echo; dns_report; pause ;;
+      5)
+        header; echo -e "  ${BOLD}How the migration works${NC}"; hr
+        echo "  • The database is dumped LOGICALLY (pg_dump / mysqldump / SQLite backup)"
+        echo "    so it restores cleanly even on a different Postgres/Timescale build."
+        echo "  • .env + docker-compose.yml are copied as-is → same DB name, password,"
+        echo "    port, image versions and SSL paths on the new server."
+        echo "  • Let's Encrypt (/etc/letsencrypt) + panel certs are copied, so panel and"
+        echo "    sub-domains work on the new IP immediately; renewal hook is re-installed."
+        echo "  • Telegram backup settings + cron are restored too."
+        echo "  • Counts of users / admins / nodes are compared after restore."
         echo
-        echo "  Requirements on new server:"
-        echo "  • Fresh Ubuntu/Debian preferred"
-        echo "  • Root SSH access"
-        echo "  • Ports 22, 80, 443 open"
-        pause
-        ;;
+        echo "  New server needs: fresh Ubuntu/Debian, root SSH, ports 22/80/443 + panel port."
+        echo "  Tip: lower DNS TTL a few hours before migrating."
+        pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── 3 Panel Settings ───────────────────
+# ═════════════════ Doctor / Quick status ═════════════════
+pg_cmd(){   # official CLI when present, docker compose fallback otherwise
+  if has_pg; then pasarguard "$@"; return; fi
+  case "$1" in
+    up) dc up -d ;; down) dc down ;; restart) dc restart ;;
+    logs) shift; dc logs --tail 100 "$@" ;; status) dc ps ;;
+    *) err "'pasarguard' CLI not installed (menu 1 → Reinstall CLI script)"; return 1 ;;
+  esac
+}
+
+doctor(){
+  echo -e "  ${BOLD}Doctor — health check${NC}"; hr
+  local P=0 W=0 F=0
+  _p(){ ok "$1"; P=$((P+1)); }; _w(){ warn "$1"; W=$((W+1)); }; _f(){ err "$1"; F=$((F+1)); }
+  has_cmd docker && _p "Docker installed ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,))" || _f "Docker not installed"
+  docker info &>/dev/null && _p "Docker daemon running" || _f "Docker daemon not running (systemctl start docker)"
+  dc version &>/dev/null && _p "docker compose available" || _f "docker compose missing"
+  [[ -f "$COMPOSE_FILE" ]] && _p "Panel files found ($APP_DIR)" || { _f "Panel not installed ($COMPOSE_FILE missing)"; hr; return 1; }
+  panel_running && _p "Panel container is UP ($(panel_image))" || _f "Panel container is DOWN"
+  db_detect
+  if [[ "$DB_KIND" == sqlite ]]; then _p "Database: SQLite ($(du -h "$SQLITE_FILE" 2>/dev/null | cut -f1))"
+  elif [[ -n "$DB_CID" ]] && db_ready; then _p "Database: $(db_label) is ready"
+  else _f "Database ($(db_label)) not reachable"; fi
+  local n; n=$(db_count users 2>/dev/null); [[ -n "$n" ]] && _p "Users in DB: $n" || _w "Could not read users table"
+  local code; code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$(panel_scheme)://127.0.0.1:$(get_port)/dashboard/" 2>/dev/null)
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && _p "Panel answers locally (HTTP $code)" || _f "Panel does not answer on $(panel_scheme)://127.0.0.1:$(get_port)"
+  local du; du=$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')
+  (( du >= 90 )) && _f "Disk usage ${du}%" || { (( du >= 80 )) && _w "Disk usage ${du}%" || _p "Disk usage ${du}%"; }
+  local mem swp; mem=$(free -m | awk '/Mem:/{print $2}'); swp=$(free -m | awk '/Swap:/{print $2}')
+  if (( mem < 1500 && swp == 0 )); then _w "RAM ${mem}MB and no swap (Tools → Create swap)"; else _p "Memory ${mem}MB / swap ${swp}MB"; fi
+  local cert key; cert=$(get_env UVICORN_SSL_CERTFILE)
+  if [[ -n "$cert" ]]; then
+    if [[ "$cert" == /etc/letsencrypt/* ]]; then _f "SSL path points to /etc/letsencrypt — container cannot read it (SSL menu → 4)"
+    elif [[ ! -f "$cert" ]]; then _f "SSL cert file missing: $cert"
+    elif ! openssl x509 -checkend 0 -noout -in "$cert" >/dev/null 2>&1; then _f "SSL certificate EXPIRED"
+    elif ! openssl x509 -checkend 1296000 -noout -in "$cert" >/dev/null 2>&1; then _w "SSL certificate expires in < 15 days"
+    else _p "SSL certificate valid until $(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2)"; fi
+  else _w "SSL not enabled on panel"; fi
+  [[ -f /etc/letsencrypt/renewal-hooks/deploy/pg-m-copy.sh ]] && _p "Auto-renew hook installed" || { [[ -d /etc/letsencrypt/live ]] && _w "No auto-renew hook (SSL menu → 11)"; }
+  [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]] && _p "Clock synchronized" || _w "Clock not synchronized (Tools → Sync time)"
+  if has_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw status | grep -qE "(^|[[:space:]])$(get_port)(/tcp)?[[:space:]]" && _p "UFW active, panel port allowed" || _w "UFW active but panel port $(get_port) has no rule"
+  else _w "UFW not active"; fi
+  local last; last=$(ls -1t "$LOCAL_BACKUP_DIR"/pg-m-*.tar.gz 2>/dev/null | head -1)
+  if [[ -z "$last" ]]; then _w "No pg-m backup yet (Backup menu)"
+  else local age=$(( ( $(date +%s) - $(stat -c %Y "$last") ) / 86400 )); (( age > 3 )) && _w "Last backup is ${age} days old" || _p "Last backup ${age} day(s) ago"; fi
+  [[ -f /etc/cron.d/pg-m-backup ]] && _p "Telegram auto-backup enabled" || _w "Telegram auto-backup not enabled"
+  hr; echo -e "  Result: ${GREEN}${P} ok${NC}  ${YELLOW}${W} warn${NC}  ${RED}${F} fail${NC}"
+  [[ $F -eq 0 ]]
+}
+
+quick_status(){
+  header
+  echo -e "  ${BOLD}Quick Status${NC}"; hr
+  if has_pg || [[ -f "$COMPOSE_FILE" ]]; then
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | grep -E "pasarguard|timescale|postgres|mysql|maria|pgbouncer|pgadmin|NAMES" || true
+  else echo "  Panel not installed"; fi
+  echo; show_info
+  echo -e "  Host : $(hostname)  |  Uptime: $(uptime -p 2>/dev/null)"
+  echo -e "  Load : $(cut -d' ' -f1-3 /proc/loadavg)   CPU: $(nproc)"
+  echo -e "  Disk : $(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+  echo -e "  Mem  : $(free -h 2>/dev/null | awk '/Mem:/{print $3"/"$2}')   Swap: $(free -h 2>/dev/null | awk '/Swap:/{print $3"/"$2}')"
+  echo; confirm "Run full health check (Doctor)?" y && { echo; doctor; }
+  pause
+}
+
+# ═════════════════ Menus ═════════════════
+m_service(){
+  while true; do
+    header
+    echo -e "  ${BOLD}2. Service Management${NC}"; hr
+    echo "  1. Start"; echo "  2. Stop"; echo "  3. Restart"; echo "  4. Status"
+    echo "  5. Logs (live, Ctrl+C to leave)"; echo "  6. Logs (last 100 lines)"
+    echo "  7. Restart database only"; echo "  8. Resource usage (CPU / RAM per container)"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) fix_compose_volumes; pg_cmd up; pause ;;
+      2) pg_cmd down; pause ;;
+      3) pg_restart; pause ;;
+      4) pg_cmd status; pause ;;
+      5) run_interruptible pg_cmd logs ;;
+      6) dc logs --tail 100 "$(app_svc)" 2>/dev/null || pg_cmd logs -n; pause ;;
+      7) db_detect; [[ -n "$DB_SVC" ]] && dc restart "$DB_SVC" || err "No DB service"; pause ;;
+      8) docker stats --no-stream 2>/dev/null; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
+pg_official(){ bash -c "$(curl -fsSL "$OFFICIAL_SCRIPT")" @ "$@"; }
+
+m_install(){
+  while true; do
+    header
+    echo -e "  ${BOLD}1. Install / Update / Uninstall${NC}"; hr
+    echo "  1. Install TimescaleDB (recommended)"
+    echo "  2. Install PostgreSQL"
+    echo "  3. Install SQLite"
+    echo "  4. Install MySQL"
+    echo "  5. Install MariaDB"
+    echo "  6. Update panel              (auto-backup first)"
+    echo "  7. Update to Pre-release / Dev"
+    echo "  8. Uninstall panel           (auto-backup first)"
+    echo "  9. Reinstall CLI script"
+    echo " 10. Install Docker only"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) pg_official install --database timescaledb; pause ;;
+      2) pg_official install --database postgresql; pause ;;
+      3) pg_official install; pause ;;
+      4) pg_official install --database mysql; pause ;;
+      5) pg_official install --database mariadb; pause ;;
+      6) info "Safety backup before update..."; create_backup lite pre-update >/dev/null && ok "Saved: $BACKUP_RESULT" || warn "Backup failed"
+         confirm "Continue with update?" y && pg_cmd update; pause ;;
+      7) info "Safety backup..."; create_backup lite pre-update >/dev/null; pg_official install --pre-release; pause ;;
+      8) info "Safety backup before uninstall..."; create_backup full pre-uninstall && ok "Saved: $BACKUP_RESULT"
+         confirm_yes "UNINSTALL the panel" && pg_cmd uninstall; pause ;;
+      9) pg_cmd install-script; pause ;;
+      10) ensure_docker && ok "Docker ready"; pause ;;
+      0) break ;;
+    esac
+  done
+}
+
 m_settings(){
   while true; do
     header
@@ -898,214 +1416,226 @@ m_settings(){
     echo "   2) Open firewall for panel port"
     echo "   3) Generate owner temp key"
     echo "   4) Show access links"
-    echo
     echo -e "  ${BOLD}Config${NC}"
     echo "   5) View .env"
     echo "   6) Edit .env"
     echo "   7) Edit docker-compose"
     echo "   8) Versions"
+    echo "   9) Panel CLI (admins / users — passes args to 'pasarguard cli')"
     echo "   0) Back"; hr
     read -rp "  Select: " o
     case $o in
       1)
-        echo -e "  Current port: ${CYAN}$(get_port)${NC}"
-        echo "  Suggested: 8443  2083  2053  2087  2096"
+        echo -e "  Current port: ${CYAN}$(get_port)${NC}   Suggested: 8443 2083 2053 2087 2096"
         read -rp "  New port: " np
         if [[ "$np" =~ ^[0-9]+$ && $np -ge 1 && $np -le 65535 ]]; then
-          if port_in_use "$np"; then
-            echo -e "  ${YELLOW}Warning: port ${np} is already in use:${NC}"
-            ss -tlnp 2>/dev/null | grep -E ":${np}[[:space:]]" || true
-            read -rp "  Continue anyway? [y/N]: " cont
-            [[ "$cont" =~ ^[Yy]$ ]] || { echo "  Cancelled"; pause; continue; }
+          if port_in_use "$np" && [[ "$np" != "$(get_port)" ]]; then
+            warn "Port ${np} already in use:"; ss -tlnp 2>/dev/null | grep -E ":${np}[[:space:]]"
+            confirm "Continue anyway?" n || { echo "  Cancelled"; pause; continue; }
           fi
-          if grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
-            sed -i "s/^UVICORN_PORT=.*/UVICORN_PORT=${np}/" "$ENV_FILE"
-          else
-            echo "UVICORN_PORT=${np}" >> "$ENV_FILE"
-          fi
-          ufw allow "${np}/tcp" 2>/dev/null || true
-          echo -e "  ${GREEN}Port set to ${np}${NC}"
-          pg_restart
-          show_info
-        else
-          echo -e "  ${RED}Invalid port${NC}"
-        fi
-        pause
-        ;;
-      2)
-        p=$(get_port)
-        ufw allow "${p}/tcp" 2>/dev/null || true
-        echo -e "  ${GREEN}Opened port ${p}${NC}"
-        pause
-        ;;
+          set_env UVICORN_PORT "$np"; ufw allow "${np}/tcp" >/dev/null 2>&1 || true
+          ok "Port set to ${np}"; pg_restart; show_info
+        else err "Invalid port"; fi
+        pause ;;
+      2) p=$(get_port); ufw allow "${p}/tcp" >/dev/null 2>&1 || true; ok "Opened port ${p}"; pause ;;
       3)
-        echo -e "  ${CYAN}Owner temp key (valid 5 min, one-time)${NC}"
-        hr
-        # Ensure DB is up before CLI
-        if has_pg; then
-          if ! docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -qiE 'timescale|postgres.*Up'; then
-            echo "  DB not healthy — restarting panel..."
-            pasarguard restart 2>/dev/null || true
-            sleep 4
-          fi
-        fi
-        if pasarguard cli generate-temp-key 2>/tmp/pg-temp-key.err; then
-          echo
-          echo -e "  ${GREEN}Use this key on login page → Owner Access${NC}"
+        echo -e "  ${CYAN}Owner temp key (valid 5 min, one-time)${NC}"; hr
+        if ! db_running && ! grep -q sqlite <<<"$(get_env SQLALCHEMY_DATABASE_URL)"; then info "DB not healthy — restarting panel..."; pg_cmd restart >/dev/null 2>&1; sleep 4; fi
+        if pasarguard cli generate-temp-key 2>/tmp/pg-temp-key.err; then echo; ok "Use this key on login page → Owner Access"
         else
-          echo -e "  ${RED}Failed. Retrying after restart...${NC}"
-          cat /tmp/pg-temp-key.err 2>/dev/null | tail -5
-          pasarguard restart 2>/dev/null || true
-          sleep 5
-          pasarguard cli generate-temp-key || echo -e "  ${RED}Still failed. Run manually:${NC} pasarguard cli generate-temp-key"
+          err "Failed. Retrying after restart..."; tail -5 /tmp/pg-temp-key.err 2>/dev/null
+          pg_cmd restart >/dev/null 2>&1; sleep 5
+          pasarguard cli generate-temp-key || err "Still failed. Run manually: pasarguard cli generate-temp-key"
         fi
-        pause
-        ;;
+        pause ;;
       4) show_info; pause ;;
       5) cat "$ENV_FILE" 2>/dev/null || echo missing; pause ;;
-      6) pasarguard edit-env ;;
-      7) pasarguard edit ;;
-      8) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -i pasarguard || true; pause ;;
+      6) pasarguard edit-env; confirm "Restart panel to apply?" y && pg_restart ;;
+      7) pasarguard edit; confirm "Restart panel to apply?" y && pg_restart ;;
+      8) echo "  pg-m $SCRIPT_VERSION"; pasarguard version-script 2>/dev/null; docker images 2>/dev/null | grep -iE 'pasarguard|timescale|postgres|mysql|maria' || true; pause ;;
+      9) pasarguard cli --help 2>/dev/null | head -30; read -rp "  pasarguard cli " args; [[ -n "$args" ]] && pasarguard cli $args; pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── 9 Database ───────────────────
+m_backup(){
+  while true; do
+    header
+    echo -e "  ${BOLD}5. Backup & Restore${NC}"; hr
+    echo "  1. Full backup now        (DB + .env + compose + data + certs + nginx)"
+    echo "  2. Lite backup now        (DB + config, small)"
+    echo "  3. Restore from pg-m backup"
+    echo "  4. List / delete backups"
+    echo "  5. Telegram auto-backup   (setup / test / send now)"
+    echo "  6. Database dump only"
+    echo "  7. Import a database dump file"
+    echo "  8. Official panel backup / restore  (pasarguard backup / restore)"
+    echo "  9. Paths & how to download a backup"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1) create_backup full backup && prune_backups; pause ;;
+      2) create_backup lite backup && prune_backups; pause ;;
+      3) header; echo -e "  ${BOLD}Restore${NC}"; hr; pick_backup && restore_archive "$PICKED"; pause ;;
+      4)
+        header; list_backups
+        read -rp "  Delete which number (Enter = none): " dn
+        if [[ "$dn" =~ ^[0-9]+$ ]]; then
+          mapfile -t _fs < <(ls -1t "$LOCAL_BACKUP_DIR"/pg-m-*.tar.gz 2>/dev/null)
+          [[ $dn -ge 1 && $dn -le ${#_fs[@]} ]] && confirm "Delete $(basename "${_fs[$((dn-1))]}")?" n && { rm -f "${_fs[$((dn-1))]}" "${_fs[$((dn-1))]}.sha256"; ok "Deleted"; }
+        fi
+        pause ;;
+      5) telegram_setup; pause ;;
+      6) db_dump_only; pause ;;
+      7)
+        db_detect; ask "Path to dump (.dump = pg_dump -Fc, .sql = mysql)" f ""
+        if [[ -f "$f" ]] && confirm_yes "OVERWRITE current database with this dump"; then
+          pg_cmd up >/dev/null 2>&1; wait_db 120
+          if [[ "$DB_KIND" == postgres ]]; then dc stop "$(app_svc)" >/dev/null 2>&1; pg_import "$f"; elif [[ "$DB_KIND" == mysql ]]; then mysql_import "$f"; fi
+          pg_cmd up; ok "Imported"
+        fi
+        pause ;;
+      8)
+        echo "  1) pasarguard backup   2) pasarguard backup-service   3) pasarguard restore"
+        read -rp "  Select: " s
+        case $s in 1) pasarguard backup ;; 2) pasarguard backup-service ;; 3) pasarguard restore ;; esac
+        pause ;;
+      9)
+        echo "  pg-m backups     : $LOCAL_BACKUP_DIR"; echo "  official backups : $BACKUP_DIR"
+        echo "  panel files      : $APP_DIR"; echo "  panel data       : $DATA_DIR"
+        echo; echo "  Download to your PC (run on your PC):"
+        echo -e "    ${CYAN}scp -P $(ssh_port) root@$(get_ip):$LOCAL_BACKUP_DIR/FILE.tar.gz .${NC}"
+        pause ;;
+      0) break ;;
+    esac
+  done
+}
+
 m_database(){
   while true; do
     header
     echo -e "  ${BOLD}9. Database Management${NC}"; hr
-    echo "  1. Show DB URL / type"
-    echo "  2. Reset PostgreSQL password"
-    echo "  3. PostgreSQL dump"
-    echo "  4. List Docker DB containers"
-    echo "  5. Fix PostgreSQL / Recover (initdb error)"
+    echo "  1. Overview  (type, size, tables, users, admins, nodes)"
+    echo "  2. Show connection info"
+    echo "  3. Open interactive DB shell"
+    echo "  4. Dump database only"
+    echo "  5. Reset DB password (updates .env + compose too)"
+    echo "  6. Optimize (VACUUM / OPTIMIZE)"
+    echo "  7. List DB containers"
+    echo "  8. Fix PostgreSQL / Recover (initdb error)"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1)
-        grep -iE 'SQLALCHEMY_DATABASE_URL|DATABASE|DB_' "$ENV_FILE" 2>/dev/null || echo "  no env"
-        pause
-        ;;
-      2)
-        read -rp "  New password: " npw
-        C=$(docker ps -qf name=postgresql | head -1)
-        if [[ -n "$C" && -n "$npw" ]]; then
-          docker exec "$C" psql -U pasarguard -d pasarguard -c "ALTER USER pasarguard WITH PASSWORD '${npw}';" && echo -e "  ${GREEN}OK${NC}"
-        else
-          echo "  No PostgreSQL container or empty password"
-        fi
-        pause
-        ;;
-      3)
-        OUT=~/pg-$(date +%F-%H%M).dump
-        C=$(docker ps -qf name=postgresql | head -1)
-        if [[ -n "$C" ]]; then
-          docker exec "$C" pg_dump -U pasarguard -d pasarguard -F c -f /tmp/pg.dump 2>/dev/null
-          docker cp "$C":/tmp/pg.dump "$OUT"
-          echo -e "  ${GREEN}$OUT${NC}"
-        else
-          echo "  no PostgreSQL container"
-        fi
-        pause
-        ;;
-      4)
-        docker ps -a --filter name=postgres --filter name=mysql --filter name=mariadb --filter name=timescale
-        pause
-        ;;
+      1) header; db_overview; pause ;;
+      2) db_show_connection; pause ;;
+      3) db_shell ;;
+      4) db_dump_only; pause ;;
       5)
-        header
-        echo -e "  ${BOLD}Fix PostgreSQL / Recover${NC}"; hr
-        echo -e "  ${YELLOW}This will:${NC}"
-        echo "  • Try automatic backup first"
-        echo "  • Stop all panel containers"
-        echo "  • Remove PostgreSQL data directory"
-        echo "  • Fix wrong volume mount in docker-compose"
-        echo "  • Start panel again (fresh DB)"
-        echo
-        echo -e "  ${RED}WARNING: Current DB data will be lost if no backup!${NC}"
-        echo
-        read -rp "  Continue? [y/N]: " conf
-        if [[ "$conf" =~ ^[Yy]$ ]]; then
-          echo -e "  ${CYAN}→ Trying backup before clean...${NC}"
-          pasarguard backup 2>/dev/null && echo -e "  ${GREEN}Backup done${NC}" || echo -e "  ${YELLOW}Backup skipped/failed (continue anyway)${NC}"
-          echo -e "  ${CYAN}→ Stopping...${NC}"
-          pasarguard down 2>/dev/null || true
-          docker rm -f $(docker ps -aq --filter name=pasarguard) 2>/dev/null || true
-          docker rm -f $(docker ps -aq --filter name=timescale) 2>/dev/null || true
-          docker rm -f $(docker ps -aq --filter name=postgres) 2>/dev/null || true
-          docker rm -f $(docker ps -aq --filter name=pgbouncer) 2>/dev/null || true
-          docker rm -f $(docker ps -aq --filter name=pgadmin) 2>/dev/null || true
-          docker volume rm $(docker volume ls -q | grep -E 'pasarguard|pgadmin') 2>/dev/null || true
-          rm -rf /var/lib/postgresql/pasarguard
-          rm -rf /var/lib/postgresql/*
-          fix_compose_volumes
-          echo -e "  ${CYAN}→ Starting...${NC}"
-          pasarguard up
-          sleep 3
-          docker ps -a --filter name=postgresql --filter name=timescale
-          echo
-          echo -e "  ${GREEN}Done. If healthy, restore your backup:${NC}"
-          echo "  pasarguard restore"
+        db_detect
+        [[ "$DB_KIND" == postgres || "$DB_KIND" == mysql ]] || { err "Only for PostgreSQL / MySQL / MariaDB"; pause; continue; }
+        read -rp "  New password (Enter = generate random): " npw
+        [[ -z "$npw" ]] && npw=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+        [[ "$npw" =~ ^[A-Za-z0-9._~-]+$ ]] || { err "Use only letters, digits and . _ ~ - (URL-safe)"; pause; continue; }
+        confirm "Change DB password and restart panel?" y || continue
+        create_backup lite pre-pwchange >/dev/null 2>&1
+        if [[ "$DB_KIND" == postgres ]]; then
+          docker exec -e PGPASSWORD="$DB_PASS" "$DB_CID" psql -U "$DB_USER" -d postgres -c "ALTER USER \"${DB_USER}\" WITH PASSWORD '${npw}';" >/dev/null
         else
-          echo "  Cancelled"
+          db_sql "ALTER USER CURRENT_USER() IDENTIFIED BY '${npw}';" >/dev/null
         fi
-        pause
-        ;;
+        if [[ $? -eq 0 ]]; then
+          for f in "$ENV_FILE" "$COMPOSE_FILE"; do
+            [[ -f "$f" ]] || continue; c=$(<"$f"); c=${c//"$DB_PASS_RAW"/"$npw"}; printf '%s\n' "$c" > "$f"
+          done
+          ok "Password changed in DB, .env and compose"; echo "  New password: $npw"
+          pg_cmd restart
+        else err "ALTER USER failed — nothing changed"; fi
+        pause ;;
+      6) db_vacuum; pause ;;
+      7) docker ps -a --filter name=postgres --filter name=mysql --filter name=maria --filter name=timescale; pause ;;
+      8)
+        header; echo -e "  ${BOLD}Fix PostgreSQL / Recover${NC}"; hr
+        pgdir=$(grep -oE '^[[:space:]]*-[[:space:]]*"?(/[^:" ]+):/var/lib/postgresql' "$COMPOSE_FILE" 2>/dev/null | sed -E 's/^[[:space:]]*-[[:space:]]*"?//; s/:\/var\/lib\/postgresql$//' | head -1)
+        pgdir="${pgdir:-/var/lib/postgresql/pasarguard}"
+        echo "  This will (ONLY for the PasarGuard compose project):"
+        echo "   • try an automatic backup, stop the stack"
+        echo "   • delete the PostgreSQL data dir:  $pgdir"
+        echo "   • fix wrong volume mount in docker-compose, start again (empty DB)"
+        err "Current DB data is LOST unless the backup succeeds."
+        if confirm_yes "Continue"; then
+          create_backup full pre-recover && ok "Backup: $BACKUP_RESULT" || warn "Backup failed/skipped"
+          info "Stopping..."; dc down 2>/dev/null || pg_cmd down
+          [[ -n "$pgdir" && "$pgdir" != "/" ]] && rm -rf "${pgdir:?}"/* "${pgdir:?}"/.[!.]* 2>/dev/null
+          fix_compose_volumes
+          info "Starting..."; pg_cmd up; sleep 3
+          docker ps -a --filter name=postgresql --filter name=timescale
+          ok "Done. Restore your data:  pg-m → Backup → 3   (or: pasarguard restore)"
+        else echo "  Cancelled"; fi
+        pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── 7 Node ───────────────────
 m_node(){
+  local nenv
   while true; do
     header
+    nenv=""; for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do [[ -f "$f" ]] && { nenv="$f"; break; }; done
     echo -e "  ${BOLD}7. Node Management${NC}"; hr
     echo "  1. Install node"
-    echo "  2. Install custom name"
-    echo "  3. Show API Key"
-    echo "  4. Show Certificate"
-    echo "  5. Show .env"
-    echo "  6. Edit .env"
-    echo "  7. Help / status"
+    echo "  2. Install with custom name"
+    echo "  3. Node control (up / down / restart / status / logs / update)"
+    echo "  4. Show API Key"
+    echo "  5. Show Certificate (ssl_cert.pem)"
+    echo "  6. Show / edit node .env"
+    echo "  7. Lock node API port to panel IP only"
+    echo "  8. Open node API port to everyone"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1) bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install; pause ;;
-      2) read -rp "  Name: " n; [[ -n "$n" ]] && bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install --name "$n"; pause ;;
+      1) bash -c "$(curl -sL "$OFFICIAL_NODE_SCRIPT")" @ install; pause ;;
+      2) ask "Name" n ""; [[ -n "$n" ]] && bash -c "$(curl -sL "$OFFICIAL_NODE_SCRIPT")" @ install --name "$n"; pause ;;
       3)
-        for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do
-          [[ -f "$f" ]] && { echo -e "  ${GREEN}$f${NC}"; grep -i API_KEY "$f" || true; }
-        done; pause
-        ;;
-      4)
-        for f in /var/lib/pg-node/certs/ssl_cert.pem /opt/pg-node/certs/ssl_cert.pem; do
-          [[ -f "$f" ]] && { echo "$f"; cat "$f"; }
-        done
-        find /var/lib /opt -name ssl_cert.pem 2>/dev/null | head -5
-        pause
-        ;;
-      5) for f in /opt/pg-node/.env /var/lib/pg-node/.env; do [[ -f "$f" ]] && cat "$f"; done; pause ;;
-      6)
-        if [[ -f /opt/pg-node/.env ]]; then nano /opt/pg-node/.env
-        elif [[ -f /var/lib/pg-node/.env ]]; then nano /var/lib/pg-node/.env
-        else read -rp "  Path: " p; [[ -f "$p" ]] && nano "$p"; fi
-        ;;
-      7) command -v pg-node >/dev/null && { pg-node --help; pg-node status; } || echo "  not installed"; pause ;;
+        has_cmd pg-node || { err "pg-node not installed"; pause; continue; }
+        echo "  up | down | restart | status | logs | update | uninstall"
+        read -rp "  Command: " nc
+        case "$nc" in up|down|restart|status|update|uninstall) pg-node "$nc" ;; logs) run_interruptible pg-node logs ;; *) err "Unknown" ;; esac
+        pause ;;
+      4) for f in /opt/pg-node/.env /var/lib/pg-node/.env /opt/pg-node*/.env; do [[ -f "$f" ]] && { echo -e "  ${GREEN}$f${NC}"; grep -iE 'API_KEY|SERVICE_PORT|SERVICE_PROTOCOL' "$f" || true; }; done; pause ;;
+      5) for f in /var/lib/pg-node/certs/ssl_cert.pem /opt/pg-node/certs/ssl_cert.pem; do [[ -f "$f" ]] && { echo "$f"; cat "$f"; }; done
+         find /var/lib /opt -name ssl_cert.pem 2>/dev/null | head -5; pause ;;
+      6) if [[ -n "$nenv" ]]; then cat "$nenv"; confirm "Edit it?" n && nano "$nenv"; else ask "Path to node .env" p ""; [[ -f "$p" ]] && nano "$p"; fi ;;
+      7)
+        np=$(grep -E '^SERVICE_PORT=' "$nenv" 2>/dev/null | cut -d= -f2 | tr -d '"'); np="${np:-62050}"
+        ask "Node API port" np "$np"; ask "Panel server IP" pip ""
+        if [[ -n "$pip" ]]; then
+          ufw_delete_port_rules "$np"; ufw allow from "$pip" to any port "$np" proto tcp >/dev/null && ufw reload >/dev/null
+          ok "Port $np reachable only from $pip"
+        fi
+        pause ;;
+      8) np=$(grep -E '^SERVICE_PORT=' "$nenv" 2>/dev/null | cut -d= -f2 | tr -d '"'); ask "Node API port" np "${np:-62050}"; ufw allow "${np}/tcp" >/dev/null; ok "Opened $np"; pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── 8 Firewall + IP Limit ───────────────────
+ufw_delete_port_rules(){
+  local p="$1" n i=0
+  while (( i < 60 )); do
+    n=$(ufw status numbered 2>/dev/null | grep -E "[[:space:]]${p}(/tcp)?[[:space:]]" | head -1 | sed -E 's/^\[ *([0-9]+)\].*/\1/')
+    [[ "$n" =~ ^[0-9]+$ ]] || break
+    yes | ufw delete "$n" >/dev/null 2>&1; i=$((i+1))
+  done
+}
+
 m_firewall(){
   while true; do
     header
     echo -e "  ${BOLD}8. Firewall & Security${NC}"; hr
-    echo "  1. Install + enable UFW"
-    echo "  2. Allow SSH 22"
+    echo "  1. Install + enable UFW   (keeps SSH $(ssh_port), 80, 443, panel port open)"
+    echo "  2. Allow SSH"
     echo "  3. Allow panel port"
     echo "  4. Allow 80 / 443"
     echo "  5. Allow custom port"
@@ -1114,89 +1644,54 @@ m_firewall(){
     echo "  8. Install Fail2Ban"
     echo "  9. IP Limit - allow only my IP to panel"
     echo " 10. IP Limit - add allowed IP"
-    echo " 11. IP Limit - list / reset panel rules"
+    echo " 11. IP Limit - show / reset panel rules"
+    echo " 12. Delete a UFW rule by number"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
       1)
-        apt install -y ufw >/dev/null 2>&1
-        ufw default deny incoming; ufw default allow outgoing
-        ufw allow 22/tcp; ufw --force enable
-        echo -e "  ${GREEN}UFW enabled${NC}"; pause
-        ;;
-      2) ufw allow 22/tcp; echo OK; pause ;;
-      3) p=$(get_port); ufw allow "${p}/tcp"; echo "  $p OK"; pause ;;
-      4) ufw allow 80/tcp; ufw allow 443/tcp; echo OK; pause ;;
+        apt-get install -y -qq ufw >/dev/null 2>&1
+        ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
+        ufw allow "$(ssh_port)/tcp" >/dev/null; ufw allow 22/tcp >/dev/null
+        ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; ufw allow "$(get_port)/tcp" >/dev/null
+        ufw --force enable >/dev/null; ok "UFW enabled (SSH $(ssh_port), 80, 443, $(get_port) allowed)"; pause ;;
+      2) ufw allow "$(ssh_port)/tcp"; pause ;;
+      3) p=$(get_port); ufw allow "${p}/tcp"; ok "$p"; pause ;;
+      4) ufw allow 80/tcp; ufw allow 443/tcp; pause ;;
       5) read -rp "  Port: " p; [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "${p}/tcp"; pause ;;
       6) ufw status verbose; pause ;;
       7)
-        grep -q bbr /etc/sysctl.conf 2>/dev/null || {
-          echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-          echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        }
-        sysctl -p >/dev/null; sysctl net.ipv4.tcp_congestion_control; pause
-        ;;
-      8)
-        apt install -y fail2ban >/dev/null 2>&1
-        systemctl enable --now fail2ban
-        echo -e "  ${GREEN}Fail2Ban on${NC}"; pause
-        ;;
+        cat > /etc/sysctl.d/99-pg-m-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+        sysctl -p /etc/sysctl.d/99-pg-m-bbr.conf >/dev/null; sysctl net.ipv4.tcp_congestion_control; pause ;;
+      8) apt-get install -y -qq fail2ban >/dev/null 2>&1; systemctl enable --now fail2ban >/dev/null 2>&1; ok "Fail2Ban on"; pause ;;
       9)
-        # Restrict panel port to current SSH client IP
-        p=$(get_port)
-        myip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
-        [[ -z "$myip" ]] && myip=$(get_ip)
-        echo -e "  Panel port: ${CYAN}${p}${NC}"
-        echo -e "  Your IP   : ${CYAN}${myip}${NC}"
-        read -rp "  Lock panel port to this IP only? (yes/no): " c
-        if [[ "$c" == yes ]]; then
-          # delete open allow for port then allow from IP
-          ufw delete allow "${p}/tcp" 2>/dev/null || true
-          ufw allow from "$myip" to any port "$p" proto tcp
-          ufw reload
-          echo -e "  ${GREEN}Panel port ${p} only from ${myip}${NC}"
-          echo -e "  ${YELLOW}Warning: other IPs cannot open panel${NC}"
+        p=$(get_port); myip=$(awk '{print $1}' <<<"${SSH_CONNECTION:-}"); [[ -z "$myip" ]] && myip=$(get_ip)
+        echo -e "  Panel port: ${CYAN}${p}${NC}   Your IP: ${CYAN}${myip}${NC}"
+        if confirm_yes "Lock panel port to this IP only"; then
+          ufw_delete_port_rules "$p"; ufw allow from "$myip" to any port "$p" proto tcp >/dev/null; ufw reload >/dev/null
+          ok "Panel port ${p} only from ${myip}"; warn "Other IPs cannot open the panel (also subscription links on this port!)"
         fi
-        pause
-        ;;
-      10)
-        p=$(get_port)
-        read -rp "  IP to allow for panel port ${p}: " ip
-        if [[ -n "$ip" ]]; then
-          ufw allow from "$ip" to any port "$p" proto tcp
-          ufw reload
-          echo -e "  ${GREEN}Allowed ${ip} -> ${p}${NC}"
-        fi
-        pause
-        ;;
+        pause ;;
+      10) p=$(get_port); read -rp "  IP to allow for port ${p}: " ip; [[ -n "$ip" ]] && { ufw allow from "$ip" to any port "$p" proto tcp >/dev/null; ufw reload >/dev/null; ok "Allowed ${ip} → ${p}"; }; pause ;;
       11)
-        p=$(get_port)
-        echo -e "  Rules related to port ${p}:"
-        ufw status numbered | grep -E "${p}|Status" || ufw status
-        echo
-        read -rp "  Reset: open panel port ${p} to world? (yes/no): " c
-        if [[ "$c" == yes ]]; then
-          # remove from-ip rules is hard; open general allow
-          ufw allow "${p}/tcp"
-          ufw reload
-          echo -e "  ${GREEN}Port ${p} open to all${NC}"
-        fi
-        pause
-        ;;
+        p=$(get_port); ufw status numbered | grep -E "${p}|Status" || ufw status
+        if confirm_yes "Reset: remove IP rules and open ${p} to the world"; then ufw_delete_port_rules "$p"; ufw allow "${p}/tcp" >/dev/null; ufw reload >/dev/null; ok "Port ${p} open to all"; fi
+        pause ;;
+      12) ufw status numbered; read -rp "  Rule number: " rn; [[ "$rn" =~ ^[0-9]+$ ]] && yes | ufw delete "$rn"; pause ;;
       0) break ;;
     esac
   done
 }
-
-# ─────────────────── 10 Tools ───────────────────
 
 m_relay(){
   while true; do
     header
     echo -e "  ${BOLD}12. Subscription Relay / Tunnel${NC}"; hr
     echo "  Use a healthy foreign VPS as reverse-proxy for sub links"
-    echo "  (user → relay VPS → this panel)"
-    hr
+    echo "  (user → relay VPS → this panel)"; hr
     echo "  1. Generate nginx config (for relay VPS)"
     echo "  2. Show helper commands"
     echo "  3. Apply SSL paths from existing certs (fix .env)"
@@ -1205,23 +1700,18 @@ m_relay(){
     case $o in
       1)
         echo
-        read -rp "  Relay domain (on healthy VPS) [sub.example.com]: " RELAY_DOM
-        read -rp "  Panel origin URL [https://panel.nexus-net.online]: " ORIGIN
-        RELAY_DOM=${RELAY_DOM:-sub.example.com}
-        ORIGIN=${ORIGIN:-https://panel.nexus-net.online}
-        # strip trailing slash
-        ORIGIN=${ORIGIN%/}
+        ask "Relay domain (on healthy VPS)" RELAY_DOM "sub.example.com"
+        dflt="https://$(get_domain_from_cert)"; [[ "$dflt" == "https://" ]] && dflt="https://panel.example.com"
+        ask "Panel origin URL" ORIGIN "$dflt"
+        ORIGIN=${ORIGIN%/}; PANEL_HOST=$(sed -E 's|https?://||; s|/.*||' <<<"$ORIGIN")
         OUT="/root/sub-relay-${RELAY_DOM}.conf"
-        cat > "$OUT" << EOF
+        cat > "$OUT" <<EOF
 # PasarGuard sub relay — install on HEALTHY foreign VPS
-# 1) Point DNS: ${RELAY_DOM} → this VPS IP
-# 2) certbot --nginx -d ${RELAY_DOM}
-# 3) copy this file to /etc/nginx/sites-available/sub-relay
-# 4) ln -sf /etc/nginx/sites-available/sub-relay /etc/nginx/sites-enabled/
-# 5) nginx -t && systemctl reload nginx
-#
-# User sub links become:
-#   https://${RELAY_DOM}/sub/...   instead of ${ORIGIN}/sub/...
+# 1) DNS: ${RELAY_DOM} → relay VPS IP
+# 2) certbot certonly --nginx -d ${RELAY_DOM}
+# 3) cp this file /etc/nginx/sites-available/sub-relay ; ln -sf into sites-enabled
+# 4) nginx -t && systemctl reload nginx
+# Sub links become: https://${RELAY_DOM}/sub/...  instead of ${ORIGIN}/sub/...
 
 server {
     listen 443 ssl http2;
@@ -1233,9 +1723,8 @@ server {
     location / {
         proxy_pass ${ORIGIN};
         proxy_ssl_server_name on;
-        proxy_ssl_name ${ORIGIN#https://};
-        proxy_ssl_name ${ORIGIN#http://};
-        proxy_set_header Host \$proxy_host;
+        proxy_ssl_name ${PANEL_HOST};
+        proxy_set_header Host ${PANEL_HOST};
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -1244,77 +1733,25 @@ server {
     }
 }
 EOF
-        # Fix Host header properly in generated file
-        # Use panel host from ORIGIN
-        PANEL_HOST=$(echo "$ORIGIN" | sed -E 's|https?://||; s|/.*||')
-        sed -i "s|proxy_set_header Host \\\$proxy_host;|proxy_set_header Host ${PANEL_HOST};|" "$OUT"
-        sed -i "/proxy_ssl_name/d" "$OUT"
-        # re-add single proxy_ssl_name
-        sed -i "/proxy_ssl_server_name on;/a\\        proxy_ssl_name ${PANEL_HOST};" "$OUT"
-        echo
-        echo -e "  ${GREEN}Config written:${NC} $OUT"
-        echo
-        cat "$OUT"
-        echo
-        echo -e "  ${CYAN}On relay VPS run:${NC}"
-        echo "    apt install -y nginx certbot python3-certbot-nginx"
-        echo "    certbot --nginx -d ${RELAY_DOM}"
-        echo "    # then place this conf and reload nginx"
-        pause
-        ;;
+        ok "Config written: $OUT"; echo; cat "$OUT"; echo
+        echo -e "  ${CYAN}On relay VPS:${NC} apt install -y nginx certbot python3-certbot-nginx ; then place this conf"
+        pause ;;
       2)
-        echo
-        echo "  Flow:  User → Relay VPS (healthy) → Panel VPS"
-        echo
+        echo; echo "  Flow:  User → Relay VPS (healthy) → Panel VPS"
         echo "  1. DNS A record of relay domain → Relay VPS IP"
-        echo "  2. Install nginx + certbot on Relay VPS"
-        echo "  3. Use option 1 to generate config"
-        echo "  4. Change client sub links to relay domain"
-        echo
-        echo "  Note: this only fixes SUBSCRIPTION download URL."
-        echo "  VPN traffic still goes to node/panel IPs unless you"
-        echo "  also move nodes or use a traffic relay."
-        pause
-        ;;
+        echo "  2. nginx + certbot on Relay VPS   3. Use option 1   4. Change sub domain to relay"
+        echo; echo "  Note: this only fixes the SUBSCRIPTION download URL."
+        echo "  VPN traffic still goes to node/panel IPs."
+        pause ;;
       3)
-        # Local fix: apply SSL from existing certs into .env
-        FOUND_CERT=""
-        FOUND_KEY=""
-        FOUND_DOMAIN=""
-        if [[ -d /var/lib/pasarguard/certs ]]; then
-          for d in /var/lib/pasarguard/certs/*/ ; do
-            [[ -d "$d" ]] || continue
-            if [[ -f "${d}fullchain.pem" && -f "${d}privkey.pem" ]]; then
-              FOUND_CERT="${d}fullchain.pem"
-              FOUND_KEY="${d}privkey.pem"
-              FOUND_DOMAIN=$(basename "$d")
-              break
-            fi
-          done
-        fi
-        if [[ -z "$FOUND_CERT" ]]; then
-          echo -e "  ${RED}No fullchain.pem/privkey.pem under /var/lib/pasarguard/certs${NC}"
-          pause
-          continue
-        fi
-        mkdir -p /opt/pasarguard
-        touch "$ENV_FILE"
-        local cur_port
-        cur_port=$(get_port)
-        sed -i '/^UVICORN_SSL_CERTFILE=/d;/^UVICORN_SSL_KEYFILE=/d;/^#UVICORN_SSL_CERTFILE=/d;/^#UVICORN_SSL_KEYFILE=/d' "$ENV_FILE"
-        echo "UVICORN_SSL_CERTFILE=${FOUND_CERT}" >> "$ENV_FILE"
-        echo "UVICORN_SSL_KEYFILE=${FOUND_KEY}" >> "$ENV_FILE"
-        if ! grep -q '^UVICORN_PORT=' "$ENV_FILE" 2>/dev/null; then
-          echo "UVICORN_PORT=${cur_port}" >> "$ENV_FILE"
-        fi
-        echo -e "  ${GREEN}Applied:${NC} $FOUND_DOMAIN (port kept: ${cur_port})"
-        read -rp "  Restart panel now? [Y/n]: " yn
-        if [[ "${yn:-Y}" =~ ^[Yy]$ ]]; then
-          pg_restart
-          pasarguard status 2>/dev/null || true
-        fi
-        pause
-        ;;
+        FOUND_CERT=""; FOUND_KEY=""; FOUND_DOMAIN=""
+        for d in "$DATA_DIR"/certs/*/; do
+          [[ -f "${d}fullchain.pem" && -f "${d}privkey.pem" ]] && { FOUND_CERT="${d}fullchain.pem"; FOUND_KEY="${d}privkey.pem"; FOUND_DOMAIN=$(basename "$d"); break; }
+        done
+        [[ -z "$FOUND_CERT" ]] && { err "No fullchain.pem/privkey.pem under $DATA_DIR/certs"; pause; continue; }
+        apply_cert_env "$FOUND_DOMAIN"
+        confirm "Restart panel now?" y && { pg_restart; pg_cmd status 2>/dev/null; }
+        pause ;;
       0) break ;;
     esac
   done
@@ -1329,120 +1766,154 @@ m_tools(){
     echo "  3. Memory & Swap"
     echo "  4. Listening ports"
     echo "  5. Restart Docker"
-    echo "  6. Docker prune"
+    echo "  6. Docker prune (unused images/cache)"
     echo "  7. Update Geo files"
     echo "  8. System info"
     echo "  9. Panel link"
     echo " 10. Who uses port 80"
     echo " 11. Create / Enable 2G Swap"
+    echo " 12. Sync time (NTP)"
+    echo " 13. Clean logs (journal + panel logs)"
+    echo " 14. Install handy tools (curl jq sqlite3 rsync htop ncdu)"
+    echo " 15. Doctor (full health check)"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
-      1) command -v speedtest-cli >/dev/null || apt install -y speedtest-cli 2>/dev/null || true
-         speedtest-cli --simple 2>/dev/null || echo n/a; pause ;;
+      1) has_cmd speedtest-cli || apt-get install -y -qq speedtest-cli >/dev/null 2>&1; speedtest-cli --simple 2>/dev/null || echo n/a; pause ;;
       2) df -h; pause ;;
       3) free -h; swapon --show 2>/dev/null || true; pause ;;
       4) ss -tlnp; pause ;;
-      5) systemctl restart docker; echo OK; pause ;;
-      6) docker system prune -f; echo OK; pause ;;
+      5) systemctl restart docker; ok "Docker restarted"; pause ;;
+      6) docker image prune -af >/dev/null; docker builder prune -f >/dev/null 2>&1; ok "Unused images removed (running containers untouched)"; pause ;;
       7)
         mkdir -p /usr/local/share/xray
         curl -fsSL -o /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>/dev/null
         curl -fsSL -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat 2>/dev/null
-        echo OK; pause
-        ;;
-      8)
-        echo "  Host $(hostname) | $(nproc) CPU"
-        grep PRETTY /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'
-        free -h | grep Mem; df -h / | tail -1; pause
-        ;;
+        ok "Geo files updated"; pause ;;
+      8) echo "  Host $(hostname) | $(nproc) CPU"; grep PRETTY /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'; free -h | grep Mem; df -h / | tail -1; pause ;;
       9) show_info; pause ;;
       10) ss -tlnp | grep ':80 ' || echo "  port 80 free"; pause ;;
       11)
-        header
-        echo -e "  ${BOLD}Create / Enable 2G Swap${NC}"; hr
-        if swapon --show 2>/dev/null | grep -q .; then
-          echo -e "  ${GREEN}Swap already active:${NC}"
-          swapon --show
-          free -h | grep -i swap
+        header; echo -e "  ${BOLD}Create / Enable 2G Swap${NC}"; hr
+        if swapon --show 2>/dev/null | grep -q .; then ok "Swap already active:"; swapon --show; free -h | grep -i swap
         else
-          echo "  Creating 2G swapfile..."
-          if [[ -f /swapfile ]]; then
-            echo "  /swapfile exists — trying to enable..."
-            chmod 600 /swapfile
-            mkswap /swapfile 2>/dev/null || true
-            swapon /swapfile 2>/dev/null || true
-          else
-            fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
-            chmod 600 /swapfile
-            mkswap /swapfile
-            swapon /swapfile
-          fi
+          if [[ -f /swapfile ]]; then chmod 600 /swapfile; mkswap /swapfile >/dev/null 2>&1; swapon /swapfile 2>/dev/null
+          else fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress; chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile; fi
           grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-          echo -e "  ${GREEN}Swap enabled${NC}"
-          free -h
+          ok "Swap enabled"; free -h
         fi
-        pause
-        ;;
+        pause ;;
+      12) timedatectl set-ntp true 2>/dev/null; systemctl restart systemd-timesyncd 2>/dev/null; sleep 2; timedatectl | grep -iE 'Local|synchronized'; pause ;;
+      13) journalctl --vacuum-size=100M >/dev/null 2>&1; find /var/lib/docker/containers -name '*-json.log' -size +50M -exec truncate -s 0 {} \; 2>/dev/null
+          find "$DATA_DIR" -name '*.log' -size +50M -exec truncate -s 0 {} \; 2>/dev/null; ok "Logs trimmed"; pause ;;
+      14) apt-get update -qq; apt-get install -y -qq curl jq sqlite3 rsync htop ncdu sshpass >/dev/null 2>&1; ok "Installed"; pause ;;
+      15) doctor; pause ;;
       0) break ;;
     esac
   done
 }
 
-# ─────────────────── Main ───────────────────
+# ═════════════════ Self update / about ═════════════════
+self_update(){
+  info "Checking ${SOURCE_URL}"
+  local tmp nv; tmp=$(mktemp)
+  curl -fsSL --max-time 30 "$SOURCE_URL" -o "$tmp" || { err "Download failed"; rm -f "$tmp"; return 1; }
+  head -1 "$tmp" | grep -q '^#!' && bash -n "$tmp" 2>/dev/null || { err "Downloaded file is not a valid script — aborting"; rm -f "$tmp"; return 1; }
+  nv=$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | cut -d'"' -f2)
+  echo "  Installed: $SCRIPT_VERSION    Latest: ${nv:-?}"
+  if [[ "$nv" == "$SCRIPT_VERSION" ]]; then ok "Already up to date"; rm -f "$tmp"; return 0; fi
+  confirm "Update pg-m to ${nv}?" y || { rm -f "$tmp"; return 0; }
+  install -m 755 "$tmp" "$INSTALL_PATH" && ok "Updated — run pg-m again" || err "Install failed"
+  rm -f "$tmp"
+}
+
+usage(){
+cat <<EOF
+PasarGuard Manager v${SCRIPT_VERSION}
+
+  pg-m                         interactive menu
+  pg-m status                  quick status
+  pg-m doctor                  health check
+  pg-m db                      database overview
+  pg-m backup [full|lite]      create a backup in ${LOCAL_BACKUP_DIR}
+  pg-m restore FILE            restore a pg-m backup / migration package
+  pg-m --restore-archive FILE  non-interactive restore (used by migration)
+  pg-m --telegram-backup       backup + send to Telegram (cron job)
+  pg-m update                  update pg-m itself
+  pg-m version
+EOF
+}
+
+# ═════════════════ Main menu ═════════════════
+DASH=""
+dash_stats(){
+  DASH=""
+  [[ -f "$COMPOSE_FILE" ]] || return
+  db_detect
+  local img tot act nodes
+  img=$(panel_image | awk -F: '{print $NF}')
+  DASH="  Image: ${img:-?}  |  DB: $(db_label)"
+  if [[ "$DB_KIND" == sqlite || ( -n "$DB_CID" ) ]] && db_ready 2>/dev/null; then
+    tot=$(db_count users 2>/dev/null); act=$(db_sql "SELECT COUNT(*) FROM users WHERE status='active';" 2>/dev/null | head -1)
+    nodes=$(db_count nodes 2>/dev/null)
+    [[ -n "$tot" ]] && DASH+="\n  Users: ${tot}${act:+ (active ${act})}${nodes:+  |  Nodes: ${nodes}}"
+  fi
+}
+
 main(){
+  dash_stats
   while true; do
     header
-    echo -e "  ${BOLD}0.${NC} Exit"
+    echo -e "  ${DIM}$(hostname) | $(get_ip) | load $(cut -d' ' -f1 /proc/loadavg) | RAM $(free -m | awk '/Mem:/{printf "%d%%", $3*100/$2}') | disk $(df -P / | awk 'NR==2{print $5}')${NC}"
+    [[ -n "$DASH" ]] && echo -e "${DIM}${DASH}${NC}"
+    [[ -n "$(conf_get MIGRATED_TO)" ]] && warn "This server was migrated to $(conf_get MIGRATED_TO)"
     hr
-    echo -e "  ${BOLD}1.${NC} Install / Update / Uninstall"
-    echo -e "  ${BOLD}2.${NC} Service Management          ${DIM}(Start/Stop/Restart/Logs)${NC}"
-    echo -e "  ${BOLD}3.${NC} Panel Settings              ${DIM}(Port / Path / Admin / .env)${NC}"
-    echo -e "  ${BOLD}4.${NC} SSL Certificate Management"
-    echo -e "  ${BOLD}5.${NC} Backup & Restore"
-    echo -e "  ${BOLD}6.${NC} Migrate to New Server       ${DIM}(Full Auto Transfer)${NC}"
+    echo -e "  ${BOLD} 0.${NC} Exit"
     hr
-    echo -e "  ${BOLD}7.${NC} Node Management"
-    echo -e "  ${BOLD}8.${NC} Firewall & Security"
-    echo -e "  ${BOLD}9.${NC} Database Management         ${DIM}(Fix PG / Recover)${NC}"
+    echo -e "  ${BOLD} 1.${NC} Install / Update / Uninstall"
+    echo -e "  ${BOLD} 2.${NC} Service Management          ${DIM}(Start/Stop/Restart/Logs)${NC}"
+    echo -e "  ${BOLD} 3.${NC} Panel Settings              ${DIM}(Port / Admin / .env)${NC}"
+    echo -e "  ${BOLD} 4.${NC} SSL Certificate Management"
+    echo -e "  ${BOLD} 5.${NC} Backup & Restore            ${DIM}(Full / Telegram)${NC}"
+    echo -e "  ${BOLD} 6.${NC} Migrate to New Server       ${DIM}(Full Auto Transfer)${NC}"
+    hr
+    echo -e "  ${BOLD} 7.${NC} Node Management"
+    echo -e "  ${BOLD} 8.${NC} Firewall & Security"
+    echo -e "  ${BOLD} 9.${NC} Database Management         ${DIM}(Overview / Fix / Recover)${NC}"
     hr
     echo -e "  ${BOLD}10.${NC} Tools & Utilities           ${DIM}(Swap / Cleanup / Speed)${NC}"
-    echo -e "  ${BOLD}11.${NC} Quick Status"
+    echo -e "  ${BOLD}11.${NC} Quick Status / Doctor"
     echo -e "  ${BOLD}12.${NC} Subscription Relay / Tunnel"
+    echo -e "  ${BOLD}13.${NC} Domains & DNS               ${DIM}(Cloudflare auto-update)${NC}"
+    echo -e "  ${BOLD}14.${NC} Update pg-m / About"
     hr
-    read -rp "  Select [0-12]: " c
+    read -rp "  Select [0-14, r=refresh]: " c
     case $c in
       0) echo -e "  ${GREEN}Bye${NC}"; exit 0 ;;
-      1) m_install ;;
-      2) m_service ;;
-      3) m_settings ;;
-      4) m_ssl ;;
-      5) m_backup ;;
-      6) m_migrate ;;
-      7) m_node ;;
-      8) m_firewall ;;
-      9) m_database ;;
-      10) m_tools ;;
-      12) m_relay ;;
-      11)
-        header
-        echo -e "  ${BOLD}Quick Status${NC}"; hr
-        if has_pg; then
-          docker ps --format "table {{.Names}}\t{{.Status}}" 2>/dev/null | grep -E "pasarguard|timescale|postgres|pgbouncer|pgadmin|NAMES" || true
-        else
-          echo "  Panel not installed"
-        fi
-        echo
-        show_info
-        echo -e "  Disk : $(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
-        echo -e "  Mem  : $(free -h 2>/dev/null | awk '/Mem:/{print $3"/"$2}')"
-        echo -e "  Swap : $(free -h 2>/dev/null | awk '/Swap:/{print $3"/"$2}')"
-        pause
-        ;;
-      *) echo -e "  ${RED}Invalid option${NC}"; sleep 1 ;;
+      1) m_install ;;  2) m_service ;;  3) m_settings ;;  4) m_ssl ;;
+      5) m_backup ;;   6) m_migrate ;;   7) m_node ;;     8) m_firewall ;;
+      9) m_database ;; 10) m_tools ;;    11) quick_status ;;
+      12) m_relay ;;   13) m_domains ;;
+      14) header; echo "  pg-m v${SCRIPT_VERSION}"; echo "  ${SOURCE_URL}"; echo; self_update; pause ;;
+      r|R) dash_stats ;;
+      *) err "Invalid option"; sleep 1 ;;
     esac
+    [[ "$c" =~ ^(1|5|6|9)$ ]] && dash_stats
   done
 }
 
-need_root
-main
+# ═════════════════ Entry point ═════════════════
+case "${1:-menu}" in
+  menu|"")            need_root; main ;;
+  -v|--version|version) echo "pg-m ${SCRIPT_VERSION}" ;;
+  -h|--help|help)     usage ;;
+  status)             need_root; AUTO=1; quick_status ;;
+  doctor)             need_root; AUTO=1; doctor ;;
+  db)                 need_root; db_overview ;;
+  backup|--backup)    need_root; AUTO=1; create_backup "${2:-full}" backup && prune_backups ;;
+  restore)            need_root; [[ -n "${2:-}" ]] || { usage; exit 1; }; restore_archive "$2" ;;
+  --restore-archive)  need_root; AUTO=1; restore_archive "${2:?archive path required}" ;;
+  --telegram-backup)  need_root; telegram_backup_job ;;
+  update|--update)    need_root; self_update ;;
+  *)                  usage; exit 1 ;;
+esac
