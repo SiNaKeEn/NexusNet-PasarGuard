@@ -1,11 +1,11 @@
-[README.md](https://github.com/user-attachments/files/33607602/README.md)
+[Uploading README.md…]()
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal menu for PasarGuard Panel & Node — with full backup, restore and one-command server migration
 
-**Version 2.0.0**
+**Version 2.1.0**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -50,7 +50,7 @@ pg-m update                 # update pg-m itself
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v2.0.0                   │
+│                 PasarGuard Manager  v2.1.0                   │
 │  Panel:UP  DB:UP                                             │
 │  https://panel.example.com/dashboard/                        │
 │  host | IP | load | RAM | disk                               │
@@ -62,7 +62,7 @@ pg-m update                 # update pg-m itself
 │  4. SSL Certificate Management                               │
 │  5. Backup & Restore               (Full / Lite / Telegram)  │
 │  6. Migrate to New Server          (Full Auto Transfer)      │
-│  7. Node Management                                          │
+│  7. Node Management      (Install / Fresh / Remove / Edit)   │
 │  8. Firewall & Security                                      │
 │  9. Database Management            (Overview / Fix)          │
 │ 10. Tools & Utilities                                        │
@@ -70,6 +70,8 @@ pg-m update                 # update pg-m itself
 │ 12. Subscription Relay / Tunnel                              │
 │ 13. Domains & DNS                  (Cloudflare auto-update)  │
 │ 14. Update pg-m / About                                      │
+│ 15. Remove / Uninstall Center      (remove anything pg-m added)│
+│ 16. Monitoring & Alerts            (auto-restart watchdog)   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -147,6 +149,18 @@ Tip: lower the DNS TTL a few hours before migrating.
 | **Relay** | nginx reverse-proxy config for subscription links |
 | **Self-update** | `pg-m update` (validates the script before replacing) |
 
+## 🆕 What's new in 2.1
+
+- **Fixed: "restore finished but 0 users"** — the old code imported while the database container was still in its first-start init phase (a temporary socket-only server). Now pg-m waits for the *real* server over TCP, imports with up to 3 retries, **checks that tables really exist**, prints the real error lines, and does **not** start the panel on an empty DB. Migration offers to retry the remote restore.
+- **Smart Restore** (Backup → 3): one numbered list of *every* backup on the server (pg-m packages, official `pasarguard backup` zips, `.sql`, `.sql.gz`, `.dump`, SQLite). Pick by **number, part of the name, full path, or `l` = latest**. Zips inside zips, official zips and raw dumps are detected automatically. Backup → 8 restores only the database; CLI: `pg-m restore`, `pg-m restore-db FILE`.
+- **Nodes done right**: migration no longer copies the old node's API key/certificate. By default a **fresh node** is installed on the new server and its address / port / **API key / certificate** are printed ready to paste into the panel. Node menu: install, **reinstall fresh**, **uninstall**, control/update, connection info, **edit .env / compose**, lock API port.
+- **Remove / Uninstall Center** (menu 15): panel, nodes, SSL + hook, Telegram/scheduled backups, watchdog, swap, BBR, Fail2Ban, UFW (disable/reset), Cloudflare token, relay files, Docker log rotation, old backups, pg-m itself — each with an `[installed]` indicator.
+- **Edit almost everything**: `.env`, compose, **core config (xray_config.json with JSON validation + revert)**, node `.env`/compose, pg-m settings, swap size, **SSH port** (tested before applying, handles Ubuntu 24.04 `ssh.socket`), backup schedule.
+- **Monitoring & Alerts** (menu 16): watchdog every 5 min — restarts panel/DB if down, alerts via Telegram on down/disk ≥ 90 %/SSL expiring (tries to renew).
+- **Server tools**: one-click optimize (swap, BBR, NTP, Docker log rotation, UFW, Fail2Ban), Docker log rotation, quieter output (no more walls of docker-compose lines).
+
+---
+
 ## 🔧 What changed in 2.0
 
 - Migration rewritten: logical DB dump + exact config copy instead of raw data directories
@@ -198,6 +212,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard
 - **SSL**: صدور برای چند ساب‌دامین، چک DNS قبل از صدور، هوک تمدید خودکار.
 - **Doctor**: بررسی سلامت کل سرور و پنل با یک دستور: `pg-m doctor`
 - **فایروال امن**: UFW پورت واقعی SSH را باز نگه می‌دارد؛ قفل کردن پورت پنل/نود روی یک IP.
+
+## 🆕 تازه‌های نسخه ۲.۱
+
+- **رفع باگ «ریستور تمام شد ولی کاربران ۰ بود»**: قبلاً import وقتی انجام می‌شد که دیتابیس هنوز در مرحله init اولیه بود. حالا منتظر سرور واقعی می‌ماند، تا ۳ بار تلاش می‌کند، وجود جدول‌ها را چک می‌کند، خطای واقعی را نشان می‌دهد و پنل را روی دیتابیس خالی بالا نمی‌آورد.
+- **ریستور هوشمند** (منوی ۵ ← ۳): یک لیست شماره‌دار از *همه* بکاپ‌های سرور (پکیج pg-m، زیپ رسمی `pasarguard backup`، `.sql`، `.dump`، SQLite). انتخاب با **شماره، قسمتی از اسم، مسیر کامل یا `l` برای آخرین**. فایل داخل فایل هم خودکار پیدا می‌شود.
+- **نود درست**: در انتقال، API key و سرتیفیکیت نود قبلی کپی نمی‌شود؛ به‌صورت پیش‌فرض یک **نود جدید** نصب می‌شود و آدرس، پورت، API key و certificate آماده کپی در پنل نشان داده می‌شود. منوی نود: نصب، نصب مجدد تازه، **حذف**، کنترل، ویرایش `.env` و compose.
+- **مرکز حذف** (منوی ۱۵): هر چیزی که pg-m نصب کرده با نشانگر `[installed]` قابل حذف است.
+- **ویرایش تقریباً همه چیز**: `.env`، compose، کانفیگ هسته (xray) با اعتبارسنجی JSON، تنظیمات نود، اندازه swap، **پورت SSH** (با تست قبل از اعمال)، زمان‌بندی بکاپ.
+- **مانیتورینگ** (منوی ۱۶): اگر پنل یا دیتابیس خاموش شود خودکار ریستارت می‌کند و در تلگرام خبر می‌دهد (دیسک، SSL).
 
 ## 🚚 مراحل انتقال سریع
 
