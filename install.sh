@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager - Installer (v2.2.1)
+#  PasarGuard Manager - Installer (v2.2.2)
 # ═══════════════════════════════════════════════════════════════
 set -uo pipefail
 
