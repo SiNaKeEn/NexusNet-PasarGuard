@@ -1,11 +1,11 @@
-[README.md](https://github.com/user-attachments/files/33727811/README.md)
+[README.md](https://github.com/user-attachments/files/33738703/README.md)
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal menu for PasarGuard Panel & Node — with full backup, restore and one-command server migration
 
-**Version 2.2.1**
+**Version 2.2.2**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -13,13 +13,11 @@
 
 One command. Full control.
 
-**[English](#-english) • [فارسی](#-فارسی)**
+**English** · [فارسی → README.fa.md](README.fa.md)
 
 </div>
 
 ---
-
-# 🇬🇧 English
 
 ## 🚀 Quick Install
 
@@ -27,226 +25,113 @@ One command. Full control.
 bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/install.sh)
 ```
 
-Or install this fixed release manually:
+Or install this release from the zip:
 
 ```bash
-# copy the pg-m binary from the zip to /usr/local/bin/pg-m (or your previous path)
 chmod +x pg-m
 cp pg-m /usr/local/bin/pg-m
+pg-m --version   # should print 2.2.2
 ```
 
-Then:
+Then run:
 
 ```bash
 pg-m
 ```
 
-CLI shortcuts (also usable from cron):
+CLI shortcuts:
 
 ```bash
 pg-m status                 # containers, URL, resources
-pg-m doctor                 # full health check (20+ checks)
+pg-m doctor                 # full health check
 pg-m db                     # database overview
 pg-m backup [full|lite]     # create backup
-pg-m restore FILE           # restore backup / migration package
+pg-m restore FILE           # restore / migration package
 pg-m update                 # update pg-m itself
 pg-m --node-certs           # weekly node-domain cert job
 ```
 
 ---
 
-## 📋 Menu
+## 📋 Main Menu (summary)
+
+1. Install / Update / Uninstall  
+2. Service Management  
+3. Panel Settings  
+4. SSL Certificate Management  
+5. Backup & Restore (Full / Lite / Telegram)  
+6. Migrate to New Server  
+7. Node Management  
+8. Firewall & Security  
+9. Database Management  
+10. Tools & Utilities  
+11. Quick Status / Doctor  
+12. Subscription Relay / Tunnel  
+13. Domains & DNS (Cloudflare)  
+14. Update pg-m / About  
+15. Remove / Uninstall Center  
+16. Monitoring & Alerts  
+**17. Node-domain Certificates** ← issue, list, delete, weekly renew + push  
+
+---
+
+## 🆕 What's new in 2.2.2
+
+### Menu 17 — Node-domain certificates (improved)
+
+| Option | What it does |
+|--------|----------------|
+| **1. Issue on THIS server = master** | Local only. **Never** asks for remote IP/password. Saves into `/var/lib/pasarguard/certs/<domain>/`. |
+| **2. Issue here + PUSH to master** | Run on the **node**. Asks master IP once (SSH key only; password not stored). |
+| **3. List ALL certs on this server** | Scans disk (`/var/lib/pasarguard/certs/`). Works on the master even for certs that were pushed from nodes. |
+| **4. Show configured paths + expiry** | Paths for domains registered in the weekly job. |
+| **5. Delete a certificate** | Removes panel cert folder; optionally also deletes the Let's Encrypt copy. Updates the job domain list. |
+| **6–9** | Run job now / enable / disable / toggle panel restart after change. |
+
+**Prove ownership methods:** Cloudflare DNS · **ArvanCloud DNS** · Standalone (port 80).
+
+Weekly cron: every Monday 04:00 (`pg-m --node-certs`). Copies only when the cert file changed.
+
+Paths to paste into the panel (host / node TLS):
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v2.2.1                   │
-│  Panel:UP  DB:UP                                             │
-│  https://panel.example.com/dashboard/                        │
-│  host | IP | load | RAM | disk                               │
-│  Image: v1.x | DB: TimescaleDB | Users: 512 (active 430)     │
-├──────────────────────────────────────────────────────────────┤
-│  1. Install / Update / Uninstall   (auto-backup before)      │
-│  2. Service Management                                       │
-│  3. Panel Settings                                           │
-│  4. SSL Certificate Management                               │
-│  5. Backup & Restore               (Full / Lite / Telegram)  │
-│  6. Migrate to New Server          (Full Auto Transfer)      │
-│  7. Node Management      (Install / Fresh / Remove / Edit)   │
-│  8. Firewall & Security                                      │
-│  9. Database Management            (Overview / Fix)          │
-│ 10. Tools & Utilities                                        │
-│ 11. Quick Status / Doctor                                    │
-│ 12. Subscription Relay / Tunnel                              │
-│ 13. Domains & DNS                  (Cloudflare auto-update)  │
-│ 14. Update pg-m / About                                      │
-│ 15. Remove / Uninstall Center      (remove anything pg-m added)│
-│ 16. Monitoring & Alerts            (auto-restart watchdog)   │
-│ 17. Node-domain Certificates       (issue + weekly renew)    │
-└──────────────────────────────────────────────────────────────┘
+/var/lib/pasarguard/certs/<domain>/fullchain.pem
+/var/lib/pasarguard/certs/<domain>/key.pem
 ```
 
----
+### Earlier fixes (2.2.1)
 
-## 🆕 What's new in 2.2.1
-
-### Bug fix — Option 1 never asks for remote credentials
-- **Option 1** = Issue on THIS server (master mode) → certificates are saved locally into `/var/lib/pasarguard/certs/<domain>/`.  
-  It **never** asks for master IP / SSH port / root password.
-- **Option 2** = Issue on this server + PUSH to master → only this path asks for the master address (run it on the node).
-- Previous push settings are cleared when you choose Option 1 so residual config cannot confuse the flow.
-- Menu labels made clearer.
-
-### ArvanCloud DNS support (in addition to Cloudflare)
-When proving domain ownership you now have three choices:
-1. Cloudflare DNS
-2. **ArvanCloud DNS** (API Key from npanel.arvancloud.ir → Profile → API Keys)
-3. Standalone port 80 (domain must point to this server)
-
-### Node-domain certificates (menu 17) — reminder
-- **Mode 1 (local/master):** certbot → files land in `/var/lib/pasarguard/certs/<domain>/{fullchain.pem,key.pem}`
-- **Mode 2 (push):** run on the server that owns the domain; give master address + root password **once** (only used to install an SSH key, never stored); weekly job renews and copies only when the cert changed.
-- Weekly cron: Monday 04:00 (`pg-m --node-certs`)
-- Menu prints the exact two paths to paste into the panel’s host/node TLS settings, with expiry dates.
+- Option 1 no longer asks for master credentials.
+- Residual push settings are cleared when choosing local mode.
+- ArvanCloud DNS support added.
 
 ---
 
-## 🔐 SSL & Node-domain certs
+## 🔐 SSL (panel menu 4) & node domains (menu 17)
 
-- Issue Let's Encrypt for one or several (sub-)domains, DNS pre-check before certbot.
-- Certs are copied to a path the panel container can read; `.env` is updated where needed.
-- Auto-renew hook re-copies certs and can restart the panel.
-- Node domains: use menu **17**. Prefer **Option 1** when the domain already points to the machine you are on (or when using Cloudflare/Arvan DNS challenge). Use **Option 2** only when the domain points to a node and you want the files on the master.
+- Let's Encrypt for one or several subdomains; DNS pre-check.
+- Certs copied to a path the panel container can read.
+- Auto-renew hook can re-copy and restart the panel.
+- For **node domains**: prefer Option 1 when the domain already points to this machine (or use Cloudflare/Arvan DNS challenge). Use Option 2 only on the node when files must live on the master.
 
----
-
-## 🗄️ Database Overview (menu 9 → 1)
-
-Works with **TimescaleDB, PostgreSQL, MySQL, MariaDB and SQLite**. Shows type, version, size, status, connections, every table with exact row count and size, users total + by status, admins and nodes list. Safe password reset updates the DB **and** `.env` / compose together.
+**Tip without API token:** turn Cloudflare proxy off (DNS only) → issue with Standalone → turn proxy back on.
 
 ---
 
-## 💾 Backup & Restore
+## 💾 Backup, DB, Migration
 
-One self-contained archive (`/root/pg-m-backups/*.tar.gz` + `.sha256`):
+- Full / Lite archives with checksum; Telegram auto-backup; smart restore.
+- Database overview for TimescaleDB / PostgreSQL / MySQL / MariaDB / SQLite.
+- One-command migration to a new VPS (package + restore + optional Cloudflare DNS switch).
 
-| Included | Full | Lite |
-|----------|:----:|:----:|
-| Database dump | ✅ | ✅ |
-| `/opt/pasarguard` (`.env`, compose) | ✅ | ✅ |
-| `/var/lib/pasarguard` (certs, xray config, templates) | ✅ | ✅ (no geo) |
-| `/etc/letsencrypt` | ✅ | ✅ |
-| nginx, `/etc/pg-m`, cron | ✅ | ✅ |
-| pg-node directories | ✅ | – |
-
-Telegram auto-backup, smart restore, official `pasarguard backup` still available.
-
-> ⚠️ Backups contain private keys. Keep them private (`chmod 600`).
-
----
-
-## 🚚 Migrate to a New VPS (menu 6)
-
-Full Auto Transfer: new IP + SSH → pre-flight → optional freeze → package (DB + config + all certs) → upload with checksum → restore on new server with same credentials → compare users/admins/nodes → optional Cloudflare DNS switch.
-
----
-
-## 🆕 What's new in 2.2 / 2.1 (summary)
-
-- Node-domain certificates (menu 17) with local + push modes and weekly job.
-- Fixed “restore finished but 0 users”.
-- Smart restore, proper node handling on migration, remove center, monitoring & alerts, edit almost everything.
+> Backups contain private keys — keep them private (`chmod 600`).
 
 ---
 
 ## 🤝 Credits
 
-- Built for the [PasarGuard](https://github.com/PasarGuard) community
-- Inspired by the classic `x-ui` management experience
-- Uses official `pasarguard` and `pg-node` commands under the hood
+Built for the [PasarGuard](https://github.com/PasarGuard) community. Inspired by classic `x-ui`. Uses official `pasarguard` and `pg-node` commands.
 
 ## 📄 License
 
-MIT License — free for personal and commercial use.
-
----
-
-# 🇮🇷 فارسی
-
-## 🚀 نصب سریع
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/install.sh)
-```
-
-یا نصب دستی این نسخه اصلاح‌شده:
-
-```bash
-chmod +x pg-m
-cp pg-m /usr/local/bin/pg-m
-```
-
-بعد فقط بزن:
-
-```bash
-pg-m
-```
-
----
-
-## 📋 منو
-
-منوی اصلی مثل نسخه قبل است + منوی **۱۷. Node-domain Certificates**.
-
----
-
-## 🆕 تازه‌های نسخه ۲.۲.۱
-
-### رفع باگ مهم
-- **گزینه ۱** = صدور سرت روی **همین سرور** (حالت مستر)  
-  فایل‌ها مستقیم در `/var/lib/pasarguard/certs/<دامنه>/` ذخیره می‌شوند.  
-  **هرگز** IP، پورت SSH یا پسورد روت نمی‌پرسد.
-- **گزینه ۲** = صدور روی این سرور + ارسال (Push) به مستر  
-  فقط این گزینه ازت آدرس مستر می‌پرسد (باید روی نود اجرا شود).
-- وقتی گزینه ۱ را انتخاب می‌کنی، تنظیمات قبلی Push پاک می‌شود تا گیج‌کننده نباشد.
-- متن منو واضح‌تر شده.
-
-### پشتیبانی DNS اروان کلود (علاوه بر Cloudflare)
-الان سه روش برای اثبات مالکیت دامنه داری:
-1. Cloudflare DNS
-2. **ArvanCloud DNS** (API Key از پنل اروان → پروفایل → API Keys)
-3. Standalone پورت ۸۰ (دامنه باید به همین سرور اشاره کند)
-
-### یادآوری منوی ۱۷ (سرتیفیکیت دامنه‌های نود)
-- **حالت ۱ (محلی / مستر):** سرت روی همین سرور گرفته و در مسیر پنل ذخیره می‌شود.
-- **حالت ۲ (Push):** روی سروری که دامنه به آن اشاره می‌کند اجرا کن؛ یک‌بار آدرس + پسورد روت مستر را می‌دهی (فقط برای نصب کلید SSH، ذخیره نمی‌شود)؛ کرون هفتگی تمدید و در صورت تغییر کپی می‌کند.
-- کرون پیش‌فرض: دوشنبه ساعت ۰۴:۰۰ (`pg-m --node-certs`)
-- منو مسیر دقیق `fullchain.pem` و `key.pem` را برای کپی در تنظیمات TLS پنل نشان می‌دهد.
-
----
-
-## 🔐 SSL و سرت دامنه نود
-
-- صدور Let's Encrypt برای یک یا چند ساب‌دامین، چک DNS قبل از صدور.
-- سرت‌ها به مسیری کپی می‌شوند که کانتینر پنل بتواند بخواند.
-- هوک تمدید خودکار + امکان ریستارت پنل.
-- برای دامنه‌های نود از منوی **۱۷** استفاده کن:
-  - دامنه به همین سرور اشاره می‌کند یا Cloudflare/Arvan داری → **گزینه ۱**
-  - دامنه به نود اشاره می‌کند و می‌خواهی فایل‌ها روی مستر باشد → **گزینه ۲** روی نود
-
----
-
-## 🗄️ نمای کلی دیتابیس، بکاپ، انتقال سرور
-
-همان امکانات نسخه ۲.۲: پشتیبانی TimescaleDB / PostgreSQL / MySQL / MariaDB / SQLite، بکاپ کامل و لایت + تلگرام، ریستور هوشمند، انتقال یک‌کلیکی به سرور جدید با مقایسه تعداد کاربر/ادمین/نود و تغییر خودکار DNS با Cloudflare.
-
----
-
-## 🤝 Credits
-
-- ساخته‌شده برای جامعه [PasarGuard](https://github.com/PasarGuard)
-- الهام‌گرفته از تجربه مدیریت کلاسیک `x-ui`
-- از دستورات رسمی `pasarguard` و `pg-node` استفاده می‌کند
-
-## 📄 License
-
-MIT — رایگان برای استفاده شخصی و تجاری.
+MIT — free for personal and commercial use.
