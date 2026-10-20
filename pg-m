@@ -2387,7 +2387,7 @@ PY
             2) confirm_yes "Delete ALL backups in $LOCAL_BACKUP_DIR" && { rm -f "$LOCAL_BACKUP_DIR"/pg-m-*; ok "Deleted"; } ;;
           esac
           pause ;;
-      15) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini"; ok "Node-cert job removed"; pause ;;
+      15) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART ARVAN_TOKEN; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini" "$PGM_DIR/arvan.ini"; ok "Node-cert job removed"; pause ;;
       14) confirm_yes "Remove pg-m (panel and data are NOT touched)" && {
             rm -f /etc/cron.d/pg-m-backup /etc/cron.d/pg-m-watchdog /etc/letsencrypt/renewal-hooks/deploy/pg-m-copy.sh
             confirm "Also delete pg-m settings (/etc/pg-m: Telegram / Cloudflare tokens)?" n && rm -rf "$PGM_DIR"
@@ -2487,13 +2487,33 @@ nc_cf_ini(){
   local t; t=$(conf_get CF_TOKEN); [[ -n "$t" ]] || return 1
   mkdir -p "$PGM_DIR"; printf 'dns_cloudflare_api_token = %s\n' "$t" > "$PGM_DIR/cloudflare.ini"; chmod 600 "$PGM_DIR/cloudflare.ini"
 }
-nc_issue(){   # nc_issue domain method(cf|standalone)
+nc_arvan_ini(){
+  local t; t=$(conf_get ARVAN_TOKEN); [[ -n "$t" ]] || return 1
+  # Accept both "Apikey xxx" and bare token
+  [[ "$t" == Apikey* || "$t" == apikey* ]] || t="Apikey $t"
+  mkdir -p "$PGM_DIR"
+  printf 'dns_arvan_key = %s\n' "$t" > "$PGM_DIR/arvan.ini"
+  chmod 600 "$PGM_DIR/arvan.ini"
+}
+nc_issue(){   # nc_issue domain method(cf|arvan|standalone)
   local d="$1" m="$2" n; n=$(nc_name "$d")
   has_cmd certbot || apt-get install -y -qq certbot >/dev/null 2>&1
   if [[ "$m" == cf ]]; then
     apt-get install -y -qq python3-certbot-dns-cloudflare >/dev/null 2>&1
     nc_cf_ini || { err "No Cloudflare token (menu 13)"; return 1; }
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$PGM_DIR/cloudflare.ini" --dns-cloudflare-propagation-seconds 30 \
+      --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$n" -d "$d"
+  elif [[ "$m" == arvan ]]; then
+    # Install plugin (pip). Prefer newer certbot-dns-arvan
+    if ! python3 -c "import certbot_dns_arvan" 2>/dev/null; then
+      apt-get install -y -qq python3-pip python3-venv >/dev/null 2>&1 || true
+      pip3 install -q --break-system-packages certbot-dns-arvan 2>/dev/null || pip3 install -q certbot-dns-arvan || {
+        err "Failed to install certbot-dns-arvan (pip). Try: pip3 install certbot-dns-arvan"; return 1
+      }
+    fi
+    nc_arvan_ini || { err "No ArvanCloud API token"; return 1; }
+    certbot certonly --authenticator dns-arvan --dns-arvan-credentials "$PGM_DIR/arvan.ini" \
+      --dns-arvan-propagation-seconds 60 \
       --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$n" -d "$d"
   else
     ufw allow 80/tcp >/dev/null 2>&1 || true; free_port_80 || return 1
@@ -2558,12 +2578,27 @@ nodecerts_job(){   # cron: weekly
 }
 nc_choose_method(){   # sets NC_M
   echo "  How to prove domain ownership:"
-  echo "   1. Cloudflare DNS  (recommended — works even if the domain points to another server; wildcard OK)"
-  echo "   2. Standalone port 80 (domain must point to THIS server)"
-  ask "Select" mm 1; if [[ "$mm" == 2 ]]; then NC_M=standalone; else NC_M=cf; fi
+  echo "   1. Cloudflare DNS  (works even if domain points elsewhere; wildcard OK)"
+  echo "   2. ArvanCloud DNS  (works even if domain points elsewhere; needs API Key)"
+  echo "   3. Standalone port 80 (domain must point to THIS server)"
+  ask "Select" mm 1
+  case "$mm" in
+    2) NC_M=arvan ;;
+    3) NC_M=standalone ;;
+    *) NC_M=cf ;;
+  esac
   if [[ "$NC_M" == cf ]] && ! cf_have; then
     echo "  Cloudflare token needs: Zone → DNS → Edit"; read -rsp "  Cloudflare API token: " t; echo
     [[ -n "$t" ]] && conf_set CF_TOKEN "$t" || { err "Token required"; return 1; }
+  fi
+  if [[ "$NC_M" == arvan ]]; then
+    local at; at=$(conf_get ARVAN_TOKEN)
+    if [[ -z "$at" ]]; then
+      echo "  ArvanCloud API Key: from npanel.arvancloud.ir → Profile → API Keys"
+      echo "  (paste the key; 'Apikey ' prefix is optional)"
+      read -rsp "  Arvan API Key: " t; echo
+      [[ -n "$t" ]] && conf_set ARVAN_TOKEN "$t" || { err "Token required"; return 1; }
+    fi
   fi
 }
 nc_enable_cron(){
@@ -2616,7 +2651,7 @@ m_nodecerts(){
       3) nc_show_paths; pause ;;
       4) nodecerts_job && ok "Done" || err "Finished with errors — see $LOG_FILE"; nc_show_paths; pause ;;
       5) nc_enable_cron; pause ;;
-      6) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini"; ok "Removed (issued certs stay on disk)"; pause ;;
+      6) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART ARVAN_TOKEN; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini" "$PGM_DIR/arvan.ini"; ok "Removed (issued certs stay on disk)"; pause ;;
       7) [[ "$(conf_get NC_RESTART)" == yes ]] && conf_set NC_RESTART no || conf_set NC_RESTART yes; ;;
       0) break ;;
     esac
