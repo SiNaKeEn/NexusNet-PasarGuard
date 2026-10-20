@@ -1,11 +1,11 @@
-[Uploading README.md…]()
+[README.md](https://github.com/user-attachments/files/33722978/README.md)
 <div align="center">
 
 # 🛡️ PasarGuard Manager
 
 ### x-ui style terminal menu for PasarGuard Panel & Node — with full backup, restore and one-command server migration
 
-**Version 2.1.0**
+**Version 2.2.0**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Bash-5%2B-green.svg)](#)
@@ -50,7 +50,7 @@ pg-m update                 # update pg-m itself
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                 PasarGuard Manager  v2.1.0                   │
+│                 PasarGuard Manager  v2.2.0                   │
 │  Panel:UP  DB:UP                                             │
 │  https://panel.example.com/dashboard/                        │
 │  host | IP | load | RAM | disk                               │
@@ -148,6 +148,15 @@ Tip: lower the DNS TTL a few hours before migrating.
 | **Tools** | Speedtest, swap, NTP sync, log cleanup, docker prune (safe), geo files |
 | **Relay** | nginx reverse-proxy config for subscription links |
 | **Self-update** | `pg-m update` (validates the script before replacing) |
+
+## 🆕 What's new in 2.2 — node-domain certificates (menu 17)
+
+Issue certificates for your **node domains** and keep them fresh on the **master panel**:
+
+- **Mode 1 – on the master:** certbot (Cloudflare DNS — works even if the domain points to the node — or standalone) → saved to `/var/lib/pasarguard/certs/<domain>/fullchain.pem` and `key.pem`.
+- **Mode 2 – push to master:** run it on the server that holds the domain; you give the master address + root password **once** (only used to install an SSH key, never stored); a weekly job renews and copies the files to the master.
+- Weekly cron (Monday 04:00, `pg-m --node-certs`), copies only when the cert changed, optional panel restart, Telegram alert on failure.
+- The menu prints the exact two paths to paste into the panel's host/node TLS settings, with expiry dates.
 
 ## 🆕 What's new in 2.1
 
