@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v2.2.0
+#  PasarGuard Manager (pg-m)  v2.2.1
 #  x-ui style management menu for PasarGuard
 #  Full backup / restore / one-command server migration
 # ═══════════════════════════════════════════════════════════════
@@ -9,7 +9,7 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'; BOLD=$'\033[1m'
 DIM=$'\033[2m'
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 SOURCE_URL="https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/pg-m"
 OFFICIAL_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh"
 OFFICIAL_NODE_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
@@ -2610,8 +2610,8 @@ m_nodecerts(){
     header
     echo -e "  ${BOLD}17. Node-domain certificates${NC}"; hr
     echo "  Domains: $(conf_get NC_DOMAINS | sed 's/^$/none/')   Mode: $(conf_get NC_MODE | sed 's/^$/-/')   Weekly job: $([[ -f /etc/cron.d/pg-m-nodecerts ]] && echo on || echo off)"; hr
-    echo "  1. Issue on THIS server = master  (certs saved straight into the panel certs dir)"
-    echo "  2. Issue on THIS server and PUSH to the master (this is a node / other server)"
+    echo "  1. Issue on THIS server = master   (local only — NO remote IP/password)"
+    echo "  2. Issue here + PUSH to master     (run on node; will ask master IP once)"
     echo "  3. Show certificate paths + expiry"
     echo "  4. Run the weekly job now"
     echo "  5. Enable weekly auto-renew job"
@@ -2621,6 +2621,9 @@ m_nodecerts(){
     read -rp "  Select: " o
     case $o in
       1)
+        # LOCAL / MASTER mode — never asks for remote IP/password
+        info "Mode: LOCAL (this server is the master). No remote credentials needed."
+        for k in NC_HOST NC_PORT NC_USER; do conf_del "$k"; done
         ask "Node domain(s), space separated" doms ""; [[ -z "$doms" ]] && continue
         nc_choose_method || { pause; continue; }
         conf_set NC_MODE local; conf_set NC_DOMAINS "$doms"; conf_set NC_METHOD "$NC_M"
