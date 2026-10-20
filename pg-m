@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PasarGuard Manager (pg-m)  v2.1.0
+#  PasarGuard Manager (pg-m)  v2.2.0
 #  x-ui style management menu for PasarGuard
 #  Full backup / restore / one-command server migration
 # ═══════════════════════════════════════════════════════════════
@@ -9,7 +9,7 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'; BOLD=$'\033[1m'
 DIM=$'\033[2m'
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 SOURCE_URL="https://raw.githubusercontent.com/SiNaKeEn/NexusNet-PasarGuard/Manager/pg-m"
 OFFICIAL_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh"
 OFFICIAL_NODE_SCRIPT="https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
@@ -735,20 +735,130 @@ free_port_80(){
 list_certs(){
   echo -e "  ${BOLD}Certificates${NC}"; hr
   [[ -d /etc/letsencrypt/live ]] || { echo "  (none)"; return; }
-  local d name exp status
+  local d name exp status fc pk
   for d in /etc/letsencrypt/live/*/; do
     [[ -d "$d" ]] || continue; name=$(basename "$d"); [[ "$name" == README || ! -f "${d}fullchain.pem" ]] && continue
-    exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
-    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${RED}EXPIRED${NC}"
-    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${YELLOW}Expires <30d${NC}"
+    fc="${d}fullchain.pem"; pk="${d}privkey.pem"
+    exp=$(openssl x509 -enddate -noout -in "$fc" 2>/dev/null | cut -d= -f2)
+    if ! openssl x509 -checkend 0 -noout -in "$fc" >/dev/null 2>&1; then status="${RED}EXPIRED${NC}"
+    elif ! openssl x509 -checkend 2592000 -noout -in "$fc" >/dev/null 2>&1; then status="${YELLOW}Expires <30d${NC}"
     else status="${GREEN}Active${NC}"; fi
     echo -e "  • ${CYAN}${name}${NC}  [${status}]"
-    echo "    Expiry : ${exp}"
-    echo "    SANs   : $(openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
-    echo "    Path   : ${d}fullchain.pem"
+    echo "    Expiry    : ${exp}"
+    echo "    SANs      : $(openssl x509 -in "$fc" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
+    echo -e "    Fullchain : ${GREEN}${fc}${NC}"
+    if [[ -f "$pk" ]]; then echo -e "    Privkey   : ${GREEN}${pk}${NC}"
+    else echo -e "    Privkey   : ${RED}missing${NC}"; fi
   done
   hr
 }
+
+show_cert_paths(){
+  local domain="$1" base fc pk d
+  [[ -z "$domain" ]] && { err "Domain required"; return 1; }
+  base="/etc/letsencrypt/live/${domain}"
+  fc="${base}/fullchain.pem"; pk="${base}/privkey.pem"
+  if [[ ! -f "$fc" ]]; then
+    for d in /etc/letsencrypt/live/*/; do
+      [[ -f "${d}fullchain.pem" ]] || continue
+      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -qE "DNS:${domain}(,|$| )"; then
+        base="${d%/}"; fc="${base}/fullchain.pem"; pk="${base}/privkey.pem"; break
+      fi
+    done
+  fi
+  echo
+  echo -e "  ${BOLD}Certificate paths — ${CYAN}${domain}${NC}"
+  hr
+  if [[ -f "$fc" ]]; then
+    echo -e "  Fullchain : ${GREEN}${fc}${NC}"
+    echo -e "  Privkey   : ${GREEN}${pk}${NC}"
+    echo "  Expiry    : $(openssl x509 -enddate -noout -in "$fc" 2>/dev/null | cut -d= -f2)"
+    echo "  SANs      : $(openssl x509 -in "$fc" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
+    hr
+    echo "  Copy these into node TLS / Xray / inbound certificate settings."
+    return 0
+  fi
+  err "No certificate found for ${domain}"
+  return 1
+}
+
+issue_cert_standalone(){
+  local domains primary host r bad found d all_ok
+  local -a cb
+  echo -e "  ${BOLD}Issue Let's Encrypt (standalone / node-friendly)${NC}"
+  hr
+  echo "  Works on panel server OR empty node (panel not required)."
+  echo "  Need: domain A-record = this server IP, port 80 open from internet."
+  echo
+  echo "  Examples:  node1.example.com"
+  echo "             node1.example.com panel.example.com"
+  read -rp "  Domain(s): " domains
+  [[ -z "$domains" ]] && return 1
+  primary=$(awk '{print $1}' <<<"$domains")
+
+  bad=0
+  for host in $domains; do
+    r=$(dns_resolve "$host")
+    if [[ "$r" != "$(get_ip)" ]]; then
+      warn "$host resolves to '${r:-nothing}' but this server is $(get_ip)"
+      bad=1
+    else
+      ok "$host → $(get_ip)"
+    fi
+  done
+  [[ $bad -eq 1 ]] && ! confirm "DNS mismatch — LE may fail. Continue?" n && return 1
+
+  all_ok=1
+  for host in $domains; do
+    found=0
+    for d in /etc/letsencrypt/live/*/; do
+      [[ -f "${d}fullchain.pem" ]] && cert_covers_domain "${d}fullchain.pem" "$host" && { found=1; break; }
+    done
+    [[ $found -eq 1 ]] || all_ok=0
+  done
+  if [[ $all_ok -eq 1 ]]; then
+    ok "Valid cert already covers: ${domains}"
+    show_cert_paths "$primary"
+    if has_pg && [[ -f "$ENV_FILE" ]] && confirm "Also apply to panel HTTPS?" n; then
+      for host in $domains; do copy_cert_to_panel "$host" 2>/dev/null || true; done
+      copy_cert_to_panel "$primary"; apply_cert_env "$primary"; install_cert_hook
+      pasarguard restart 2>/dev/null || true; ssl_health
+    fi
+    return 0
+  fi
+
+  apt-get install -y -qq certbot >/dev/null 2>&1 || true
+  ufw allow 80/tcp >/dev/null 2>&1 || true
+  free_port_80 || return 1
+
+  cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$primary")
+  for host in $domains; do cb+=(-d "$host"); done
+  info "Running certbot..."
+  if ! "${cb[@]}"; then
+    err "certbot failed (DNS + port 80 from internet)"
+    has_pg && pasarguard up >/dev/null 2>&1 || true
+    return 1
+  fi
+  has_pg && pasarguard up >/dev/null 2>&1 || true
+
+  if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]]; then
+    ok "Certificate issued"
+    show_cert_paths "$primary"
+    install_cert_hook 2>/dev/null || true
+    systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+    if has_pg && [[ -f "$ENV_FILE" ]] && confirm "Panel found — apply to panel HTTPS too?" n; then
+      for host in $domains; do copy_cert_to_panel "$host" || true; done
+      copy_cert_to_panel "$primary"; apply_cert_env "$primary"
+      pasarguard restart 2>/dev/null || true; ssl_health
+    else
+      info "Use Fullchain + Privkey paths above for node TLS."
+    fi
+    return 0
+  fi
+  err "Files missing under /etc/letsencrypt/live/${primary}/"
+  return 1
+}
+
 copy_cert_to_panel(){
   local domain="$1" src="" d
   if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then src="/etc/letsencrypt/live/${domain}"
@@ -827,8 +937,8 @@ m_ssl(){
     header
     echo -e "  ${BOLD}4. SSL Certificate Management${NC}"; hr
     echo "  1. SSL health check / debug"
-    echo "  2. List Let's Encrypt certs"
-    echo "  3. Issue cert (domain / sub-domains) + apply"
+    echo "  2. List Let's Encrypt certs (fullchain + privkey)"
+    echo "  3. Issue cert + apply to PANEL"
     echo "  4. Fix paths (copy LE → panel + .env)"
     echo "  5. Renew all + re-copy to panel"
     echo "  6. Delete / revoke certificate"
@@ -838,6 +948,8 @@ m_ssl(){
     echo " 10. Restart panel"
     echo " 11. Install auto-renew hook (recommended)"
     echo " 12. DNS check of all certificate domains"
+    echo " 13. Issue cert for NODE / bare server (paths only)"
+    echo " 14. Show fullchain + privkey paths for a domain"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -872,9 +984,16 @@ m_ssl(){
         "${cb[@]}"
         has_pg && pasarguard up >/dev/null 2>&1 || true
         if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]]; then
-          for host in $domains; do copy_cert_to_panel "$host" || true; done
-          copy_cert_to_panel "$primary"
-          apply_cert_env "$primary"; install_cert_hook; pasarguard restart; ssl_health
+          ok "Certificate issued"
+          show_cert_paths "$primary"
+          if has_pg && [[ -f "$ENV_FILE" ]]; then
+            for host in $domains; do copy_cert_to_panel "$host" || true; done
+            copy_cert_to_panel "$primary"
+            apply_cert_env "$primary"; install_cert_hook; pasarguard restart 2>/dev/null || true; ssl_health
+          else
+            info "No panel — use Fullchain + Privkey paths above for node TLS"
+            install_cert_hook 2>/dev/null || true
+          fi
         else err "certbot failed (check DNS + port 80 from the internet)"; fi
         pause ;;
       4)
@@ -917,6 +1036,11 @@ m_ssl(){
       10) pasarguard restart; pause ;;
       11) install_cert_hook; systemctl enable --now certbot.timer >/dev/null 2>&1 || true; pause ;;
       12) dns_report; pause ;;
+      13) issue_cert_standalone; pause ;;
+      14)
+        ask "Domain" _dom ""
+        [[ -n "$_dom" ]] && show_cert_paths "$_dom"
+        pause ;;
       0) break ;;
     esac
   done
@@ -1782,6 +1906,8 @@ m_node(){
     echo "  8. Edit node docker-compose"
     echo "  9. Lock node API port to panel IP only"
     echo " 10. Open node API port to everyone"
+    echo " 11. Issue domain SSL for node TLS (show paths)"
+    echo " 12. Show domain SSL paths (fullchain + privkey)"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -1813,6 +1939,11 @@ m_node(){
       10) node_pick || { pause; continue; }
          nenv=$(node_env_of "$NODE_DIR"); np=$(grep -E '^SERVICE_PORT=' "$nenv" 2>/dev/null | cut -d= -f2 | tr -d '"'); ask "Node API port" np "${np:-62050}"
          ufw allow "${np}/tcp" >/dev/null; ok "Opened $np"; pause ;;
+      11) issue_cert_standalone; pause ;;
+      12)
+        ask "Domain" _dom ""
+        [[ -n "$_dom" ]] && show_cert_paths "$_dom"
+        pause ;;
       0) break ;;
     esac
   done
