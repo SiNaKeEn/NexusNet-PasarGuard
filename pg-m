@@ -735,130 +735,20 @@ free_port_80(){
 list_certs(){
   echo -e "  ${BOLD}Certificates${NC}"; hr
   [[ -d /etc/letsencrypt/live ]] || { echo "  (none)"; return; }
-  local d name exp status fc pk
+  local d name exp status
   for d in /etc/letsencrypt/live/*/; do
     [[ -d "$d" ]] || continue; name=$(basename "$d"); [[ "$name" == README || ! -f "${d}fullchain.pem" ]] && continue
-    fc="${d}fullchain.pem"; pk="${d}privkey.pem"
-    exp=$(openssl x509 -enddate -noout -in "$fc" 2>/dev/null | cut -d= -f2)
-    if ! openssl x509 -checkend 0 -noout -in "$fc" >/dev/null 2>&1; then status="${RED}EXPIRED${NC}"
-    elif ! openssl x509 -checkend 2592000 -noout -in "$fc" >/dev/null 2>&1; then status="${YELLOW}Expires <30d${NC}"
+    exp=$(openssl x509 -enddate -noout -in "${d}fullchain.pem" 2>/dev/null | cut -d= -f2)
+    if ! openssl x509 -checkend 0 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${RED}EXPIRED${NC}"
+    elif ! openssl x509 -checkend 2592000 -noout -in "${d}fullchain.pem" >/dev/null 2>&1; then status="${YELLOW}Expires <30d${NC}"
     else status="${GREEN}Active${NC}"; fi
     echo -e "  • ${CYAN}${name}${NC}  [${status}]"
-    echo "    Expiry    : ${exp}"
-    echo "    SANs      : $(openssl x509 -in "$fc" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
-    echo -e "    Fullchain : ${GREEN}${fc}${NC}"
-    if [[ -f "$pk" ]]; then echo -e "    Privkey   : ${GREEN}${pk}${NC}"
-    else echo -e "    Privkey   : ${RED}missing${NC}"; fi
+    echo "    Expiry : ${exp}"
+    echo "    SANs   : $(openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
+    echo "    Path   : ${d}fullchain.pem"
   done
   hr
 }
-
-show_cert_paths(){
-  local domain="$1" base fc pk d
-  [[ -z "$domain" ]] && { err "Domain required"; return 1; }
-  base="/etc/letsencrypt/live/${domain}"
-  fc="${base}/fullchain.pem"; pk="${base}/privkey.pem"
-  if [[ ! -f "$fc" ]]; then
-    for d in /etc/letsencrypt/live/*/; do
-      [[ -f "${d}fullchain.pem" ]] || continue
-      if openssl x509 -in "${d}fullchain.pem" -noout -text 2>/dev/null | grep -qE "DNS:${domain}(,|$| )"; then
-        base="${d%/}"; fc="${base}/fullchain.pem"; pk="${base}/privkey.pem"; break
-      fi
-    done
-  fi
-  echo
-  echo -e "  ${BOLD}Certificate paths — ${CYAN}${domain}${NC}"
-  hr
-  if [[ -f "$fc" ]]; then
-    echo -e "  Fullchain : ${GREEN}${fc}${NC}"
-    echo -e "  Privkey   : ${GREEN}${pk}${NC}"
-    echo "  Expiry    : $(openssl x509 -enddate -noout -in "$fc" 2>/dev/null | cut -d= -f2)"
-    echo "  SANs      : $(openssl x509 -in "$fc" -noout -text 2>/dev/null | grep -oE 'DNS:[^, ]+' | sed 's/DNS://' | paste -sd' ' -)"
-    hr
-    echo "  Copy these into node TLS / Xray / inbound certificate settings."
-    return 0
-  fi
-  err "No certificate found for ${domain}"
-  return 1
-}
-
-issue_cert_standalone(){
-  local domains primary host r bad found d all_ok
-  local -a cb
-  echo -e "  ${BOLD}Issue Let's Encrypt (standalone / node-friendly)${NC}"
-  hr
-  echo "  Works on panel server OR empty node (panel not required)."
-  echo "  Need: domain A-record = this server IP, port 80 open from internet."
-  echo
-  echo "  Examples:  node1.example.com"
-  echo "             node1.example.com panel.example.com"
-  read -rp "  Domain(s): " domains
-  [[ -z "$domains" ]] && return 1
-  primary=$(awk '{print $1}' <<<"$domains")
-
-  bad=0
-  for host in $domains; do
-    r=$(dns_resolve "$host")
-    if [[ "$r" != "$(get_ip)" ]]; then
-      warn "$host resolves to '${r:-nothing}' but this server is $(get_ip)"
-      bad=1
-    else
-      ok "$host → $(get_ip)"
-    fi
-  done
-  [[ $bad -eq 1 ]] && ! confirm "DNS mismatch — LE may fail. Continue?" n && return 1
-
-  all_ok=1
-  for host in $domains; do
-    found=0
-    for d in /etc/letsencrypt/live/*/; do
-      [[ -f "${d}fullchain.pem" ]] && cert_covers_domain "${d}fullchain.pem" "$host" && { found=1; break; }
-    done
-    [[ $found -eq 1 ]] || all_ok=0
-  done
-  if [[ $all_ok -eq 1 ]]; then
-    ok "Valid cert already covers: ${domains}"
-    show_cert_paths "$primary"
-    if has_pg && [[ -f "$ENV_FILE" ]] && confirm "Also apply to panel HTTPS?" n; then
-      for host in $domains; do copy_cert_to_panel "$host" 2>/dev/null || true; done
-      copy_cert_to_panel "$primary"; apply_cert_env "$primary"; install_cert_hook
-      pasarguard restart 2>/dev/null || true; ssl_health
-    fi
-    return 0
-  fi
-
-  apt-get install -y -qq certbot >/dev/null 2>&1 || true
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  free_port_80 || return 1
-
-  cb=(certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$primary")
-  for host in $domains; do cb+=(-d "$host"); done
-  info "Running certbot..."
-  if ! "${cb[@]}"; then
-    err "certbot failed (DNS + port 80 from internet)"
-    has_pg && pasarguard up >/dev/null 2>&1 || true
-    return 1
-  fi
-  has_pg && pasarguard up >/dev/null 2>&1 || true
-
-  if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]]; then
-    ok "Certificate issued"
-    show_cert_paths "$primary"
-    install_cert_hook 2>/dev/null || true
-    systemctl enable --now certbot.timer >/dev/null 2>&1 || true
-    if has_pg && [[ -f "$ENV_FILE" ]] && confirm "Panel found — apply to panel HTTPS too?" n; then
-      for host in $domains; do copy_cert_to_panel "$host" || true; done
-      copy_cert_to_panel "$primary"; apply_cert_env "$primary"
-      pasarguard restart 2>/dev/null || true; ssl_health
-    else
-      info "Use Fullchain + Privkey paths above for node TLS."
-    fi
-    return 0
-  fi
-  err "Files missing under /etc/letsencrypt/live/${primary}/"
-  return 1
-}
-
 copy_cert_to_panel(){
   local domain="$1" src="" d
   if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then src="/etc/letsencrypt/live/${domain}"
@@ -937,8 +827,8 @@ m_ssl(){
     header
     echo -e "  ${BOLD}4. SSL Certificate Management${NC}"; hr
     echo "  1. SSL health check / debug"
-    echo "  2. List Let's Encrypt certs (fullchain + privkey)"
-    echo "  3. Issue cert + apply to PANEL"
+    echo "  2. List Let's Encrypt certs"
+    echo "  3. Issue cert (domain / sub-domains) + apply"
     echo "  4. Fix paths (copy LE → panel + .env)"
     echo "  5. Renew all + re-copy to panel"
     echo "  6. Delete / revoke certificate"
@@ -948,8 +838,6 @@ m_ssl(){
     echo " 10. Restart panel"
     echo " 11. Install auto-renew hook (recommended)"
     echo " 12. DNS check of all certificate domains"
-    echo " 13. Issue cert for NODE / bare server (paths only)"
-    echo " 14. Show fullchain + privkey paths for a domain"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -984,16 +872,9 @@ m_ssl(){
         "${cb[@]}"
         has_pg && pasarguard up >/dev/null 2>&1 || true
         if [[ -f "/etc/letsencrypt/live/${primary}/fullchain.pem" ]]; then
-          ok "Certificate issued"
-          show_cert_paths "$primary"
-          if has_pg && [[ -f "$ENV_FILE" ]]; then
-            for host in $domains; do copy_cert_to_panel "$host" || true; done
-            copy_cert_to_panel "$primary"
-            apply_cert_env "$primary"; install_cert_hook; pasarguard restart 2>/dev/null || true; ssl_health
-          else
-            info "No panel — use Fullchain + Privkey paths above for node TLS"
-            install_cert_hook 2>/dev/null || true
-          fi
+          for host in $domains; do copy_cert_to_panel "$host" || true; done
+          copy_cert_to_panel "$primary"
+          apply_cert_env "$primary"; install_cert_hook; pasarguard restart; ssl_health
         else err "certbot failed (check DNS + port 80 from the internet)"; fi
         pause ;;
       4)
@@ -1036,11 +917,6 @@ m_ssl(){
       10) pasarguard restart; pause ;;
       11) install_cert_hook; systemctl enable --now certbot.timer >/dev/null 2>&1 || true; pause ;;
       12) dns_report; pause ;;
-      13) issue_cert_standalone; pause ;;
-      14)
-        ask "Domain" _dom ""
-        [[ -n "$_dom" ]] && show_cert_paths "$_dom"
-        pause ;;
       0) break ;;
     esac
   done
@@ -1906,8 +1782,6 @@ m_node(){
     echo "  8. Edit node docker-compose"
     echo "  9. Lock node API port to panel IP only"
     echo " 10. Open node API port to everyone"
-    echo " 11. Issue domain SSL for node TLS (show paths)"
-    echo " 12. Show domain SSL paths (fullchain + privkey)"
     echo "  0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -1939,11 +1813,6 @@ m_node(){
       10) node_pick || { pause; continue; }
          nenv=$(node_env_of "$NODE_DIR"); np=$(grep -E '^SERVICE_PORT=' "$nenv" 2>/dev/null | cut -d= -f2 | tr -d '"'); ask "Node API port" np "${np:-62050}"
          ufw allow "${np}/tcp" >/dev/null; ok "Opened $np"; pause ;;
-      11) issue_cert_standalone; pause ;;
-      12)
-        ask "Domain" _dom ""
-        [[ -n "$_dom" ]] && show_cert_paths "$_dom"
-        pause ;;
       0) break ;;
     esac
   done
@@ -2474,6 +2343,7 @@ m_remove(){
     printf "  12. Docker log-rotation setting               %b\n" "$(rm_tag chk_logrot)"
     printf "  13. Old pg-m backups (delete by age / all)    %b\n" "$(rm_tag chk_backups)"
     echo   "  14. pg-m itself"
+    echo   "  15. Node-cert weekly job + settings"
     echo   "   0. Back"; hr
     read -rp "  Select: " o
     case $o in
@@ -2517,6 +2387,7 @@ PY
             2) confirm_yes "Delete ALL backups in $LOCAL_BACKUP_DIR" && { rm -f "$LOCAL_BACKUP_DIR"/pg-m-*; ok "Deleted"; } ;;
           esac
           pause ;;
+      15) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini"; ok "Node-cert job removed"; pause ;;
       14) confirm_yes "Remove pg-m (panel and data are NOT touched)" && {
             rm -f /etc/cron.d/pg-m-backup /etc/cron.d/pg-m-watchdog /etc/letsencrypt/renewal-hooks/deploy/pg-m-copy.sh
             confirm "Also delete pg-m settings (/etc/pg-m: Telegram / Cloudflare tokens)?" n && rm -rf "$PGM_DIR"
@@ -2540,6 +2411,7 @@ PasarGuard Manager v${SCRIPT_VERSION}
   pg-m --restore-archive FILE [--fresh-node]   non-interactive restore (used by migration)
   pg-m --telegram-backup       backup + send to Telegram (cron job)
   pg-m --watchdog              restart panel if down + alerts (cron job)
+  pg-m --node-certs            weekly node-domain cert renew + deliver to master (cron job)
   pg-m update                  update pg-m itself
   pg-m version
 EOF
@@ -2588,8 +2460,9 @@ main(){
     echo -e "  ${BOLD}14.${NC} Update pg-m / About"
     echo -e "  ${BOLD}15.${NC} Remove / Uninstall Center"
     echo -e "  ${BOLD}16.${NC} Monitoring & Alerts         ${DIM}(auto-restart watchdog)${NC}"
+    echo -e "  ${BOLD}17.${NC} Node-domain Certificates    ${DIM}(issue + weekly renew + to master)${NC}"
     hr
-    read -rp "  Select [0-16, r=refresh]: " c
+    read -rp "  Select [0-17, r=refresh]: " c
     case $c in
       0) echo -e "  ${GREEN}Bye${NC}"; exit 0 ;;
       1) m_install ;;  2) m_service ;;  3) m_settings ;;  4) m_ssl ;;
@@ -2597,11 +2470,156 @@ main(){
       9) m_database ;; 10) m_tools ;;    11) quick_status ;;
       12) m_relay ;;   13) m_domains ;;
       14) header; echo "  pg-m v${SCRIPT_VERSION}"; echo "  ${SOURCE_URL}"; echo; self_update; pause ;;
-      15) m_remove ;;  16) m_monitor ;;
+      15) m_remove ;;  16) m_monitor ;;  17) m_nodecerts ;;
       r|R) dash_stats ;;
       *) err "Invalid option"; sleep 1 ;;
     esac
     [[ "$c" =~ ^(1|5|6|9|15)$ ]] && dash_stats
+  done
+}
+
+# ═════════════════ Node-domain certificates (issue + weekly renew + deliver to master) ═════════════════
+# Files land in /var/lib/pasarguard/certs/<domain>/{fullchain.pem,key.pem} on the MASTER panel.
+NC_CHANGED=0
+nc_name(){ echo "${1#\*.}"; }
+nc_key(){ echo /root/.ssh/pgm_nodecert; }
+nc_cf_ini(){
+  local t; t=$(conf_get CF_TOKEN); [[ -n "$t" ]] || return 1
+  mkdir -p "$PGM_DIR"; printf 'dns_cloudflare_api_token = %s\n' "$t" > "$PGM_DIR/cloudflare.ini"; chmod 600 "$PGM_DIR/cloudflare.ini"
+}
+nc_issue(){   # nc_issue domain method(cf|standalone)
+  local d="$1" m="$2" n; n=$(nc_name "$d")
+  has_cmd certbot || apt-get install -y -qq certbot >/dev/null 2>&1
+  if [[ "$m" == cf ]]; then
+    apt-get install -y -qq python3-certbot-dns-cloudflare >/dev/null 2>&1
+    nc_cf_ini || { err "No Cloudflare token (menu 13)"; return 1; }
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$PGM_DIR/cloudflare.ini" --dns-cloudflare-propagation-seconds 30 \
+      --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$n" -d "$d"
+  else
+    ufw allow 80/tcp >/dev/null 2>&1 || true; free_port_80 || return 1
+    certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --cert-name "$n" -d "$d"
+    has_pg && pasarguard up >/dev/null 2>&1 || true
+  fi
+  [[ -f "/etc/letsencrypt/live/$n/fullchain.pem" ]]
+}
+nc_install_local(){   # copy LE → panel certs dir on THIS server
+  local n="$1" src="/etc/letsencrypt/live/$1" dst="$DATA_DIR/certs/$1"
+  [[ -f "$src/fullchain.pem" ]] || return 1
+  mkdir -p "$dst"
+  cmp -s "$src/fullchain.pem" "$dst/fullchain.pem" || NC_CHANGED=1
+  cp -L "$src/fullchain.pem" "$dst/fullchain.pem"; cp -L "$src/privkey.pem" "$dst/key.pem"; cp -L "$src/privkey.pem" "$dst/privkey.pem"
+  chmod 644 "$dst/fullchain.pem"; chmod 600 "$dst/key.pem" "$dst/privkey.pem"
+}
+nc_push(){   # copy LE → master over SSH key
+  local n="$1" host port user key src rdir lsum rsum o
+  host=$(conf_get NC_HOST); port=$(conf_get NC_PORT); user=$(conf_get NC_USER); key=$(nc_key)
+  src="/etc/letsencrypt/live/$n"; rdir="/var/lib/pasarguard/certs/$n"
+  o=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes -i "$key")
+  ssh "${o[@]}" -p "$port" "$user@$host" "mkdir -p $rdir" || return 1
+  lsum=$(sha256sum "$src/fullchain.pem" | cut -d' ' -f1)
+  rsum=$(ssh "${o[@]}" -p "$port" "$user@$host" "sha256sum $rdir/fullchain.pem 2>/dev/null" | cut -d' ' -f1)
+  [[ "$lsum" == "$rsum" ]] && return 0
+  NC_CHANGED=1
+  local tgt="$user@$host"; [[ "$host" == *:* ]] && tgt="$user@[$host]"
+  scp "${o[@]}" -P "$port" -q "$src/fullchain.pem" "$src/privkey.pem" "$tgt:$rdir/" || return 1
+  ssh "${o[@]}" -p "$port" "$user@$host" "cd $rdir && cp -f privkey.pem key.pem && chmod 644 fullchain.pem && chmod 600 key.pem privkey.pem"
+}
+nc_show_paths(){
+  local d n exp where; where=$([[ "$(conf_get NC_MODE)" == push ]] && echo "on MASTER $(conf_get NC_HOST)" || echo "on this server (master)")
+  echo -e "  ${BOLD}Certificate paths ${where}${NC}"; hr
+  for d in $(conf_get NC_DOMAINS); do
+    n=$(nc_name "$d")
+    exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$n/fullchain.pem" 2>/dev/null | cut -d= -f2)
+    echo -e "  ${CYAN}${d}${NC}   expires: ${exp:-unknown}"
+    echo "    fullchain : /var/lib/pasarguard/certs/${n}/fullchain.pem"
+    echo "    key       : /var/lib/pasarguard/certs/${n}/key.pem"
+  done
+  hr
+  echo "  Use these two paths in the panel (host / node TLS settings). The panel container sees the same paths."
+  echo "  Weekly job: $([[ -f /etc/cron.d/pg-m-nodecerts ]] && echo 'ENABLED (Mon 04:00)' || echo 'not enabled')"
+}
+nodecerts_job(){   # cron: weekly
+  AUTO=1; NC_CHANGED=0
+  local doms mode d n rc=0; doms=$(conf_get NC_DOMAINS); mode=$(conf_get NC_MODE)
+  [[ -n "$doms" ]] || { log "nodecerts: no domains configured"; return 0; }
+  for d in $doms; do
+    n=$(nc_name "$d")
+    if [[ -f "/etc/letsencrypt/live/$n/fullchain.pem" ]]; then certbot renew --cert-name "$n" -q >>"$LOG_FILE" 2>&1
+    else nc_issue "$d" "$(conf_get NC_METHOD)" >>"$LOG_FILE" 2>&1; fi
+    if [[ ! -f "/etc/letsencrypt/live/$n/fullchain.pem" ]]; then alert_once "nc_$n" "node-cert: cannot obtain/renew cert for $d"; rc=1; continue; fi
+    if [[ "$mode" == push ]]; then nc_push "$n" || { alert_once "nc_push_$n" "node-cert: push to master failed for $n"; rc=1; }
+    else nc_install_local "$n"; fi
+  done
+  if [[ $NC_CHANGED -eq 1 && "$(conf_get NC_RESTART)" == yes ]]; then
+    if [[ "$mode" == push ]]; then ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$(nc_key)" -p "$(conf_get NC_PORT)" "$(conf_get NC_USER)@$(conf_get NC_HOST)" "pasarguard restart || docker compose -f /opt/pasarguard/docker-compose.yml restart" >/dev/null 2>&1
+    else pg_restart; fi
+  fi
+  log "nodecerts finished rc=$rc changed=$NC_CHANGED"; return $rc
+}
+nc_choose_method(){   # sets NC_M
+  echo "  How to prove domain ownership:"
+  echo "   1. Cloudflare DNS  (recommended — works even if the domain points to another server; wildcard OK)"
+  echo "   2. Standalone port 80 (domain must point to THIS server)"
+  ask "Select" mm 1; if [[ "$mm" == 2 ]]; then NC_M=standalone; else NC_M=cf; fi
+  if [[ "$NC_M" == cf ]] && ! cf_have; then
+    echo "  Cloudflare token needs: Zone → DNS → Edit"; read -rsp "  Cloudflare API token: " t; echo
+    [[ -n "$t" ]] && conf_set CF_TOKEN "$t" || { err "Token required"; return 1; }
+  fi
+}
+nc_enable_cron(){
+  echo "0 4 * * 1 root $INSTALL_PATH --node-certs >> $LOG_FILE 2>&1" > /etc/cron.d/pg-m-nodecerts; chmod 644 /etc/cron.d/pg-m-nodecerts
+  ok "Weekly job enabled (every Monday 04:00)"
+}
+m_nodecerts(){
+  while true; do
+    header
+    echo -e "  ${BOLD}17. Node-domain certificates${NC}"; hr
+    echo "  Domains: $(conf_get NC_DOMAINS | sed 's/^$/none/')   Mode: $(conf_get NC_MODE | sed 's/^$/-/')   Weekly job: $([[ -f /etc/cron.d/pg-m-nodecerts ]] && echo on || echo off)"; hr
+    echo "  1. Issue on THIS server = master  (certs saved straight into the panel certs dir)"
+    echo "  2. Issue on THIS server and PUSH to the master (this is a node / other server)"
+    echo "  3. Show certificate paths + expiry"
+    echo "  4. Run the weekly job now"
+    echo "  5. Enable weekly auto-renew job"
+    echo "  6. Disable job + forget settings"
+    echo "  7. Restart master panel after a changed cert: $([[ "$(conf_get NC_RESTART)" == yes ]] && echo YES || echo no)  (toggle)"
+    echo "  0. Back"; hr
+    read -rp "  Select: " o
+    case $o in
+      1)
+        ask "Node domain(s), space separated" doms ""; [[ -z "$doms" ]] && continue
+        nc_choose_method || { pause; continue; }
+        conf_set NC_MODE local; conf_set NC_DOMAINS "$doms"; conf_set NC_METHOD "$NC_M"
+        for d in $doms; do
+          info "Issuing $d ..."
+          if nc_issue "$d" "$NC_M" && nc_install_local "$(nc_name "$d")"; then ok "$d ready"; else err "$d failed (check DNS / token)"; fi
+        done
+        nc_show_paths; confirm "Enable weekly auto-renew now?" y && nc_enable_cron; pause ;;
+      2)
+        ask "MASTER panel address (IP/host)" mh ""; ask "SSH port" mp 22; ask "SSH user" mu root
+        [[ -z "$mh" ]] && continue
+        has_cmd sshpass || apt-get install -y -qq sshpass >/dev/null 2>&1
+        mkdir -p /root/.ssh; chmod 700 /root/.ssh
+        [[ -f "$(nc_key)" ]] || ssh-keygen -t ed25519 -N "" -f "$(nc_key)" -C "pg-m-nodecert@$(hostname)" >/dev/null
+        read -rsp "  Master SSH password (used ONCE to install the key, not stored): " MPW; echo
+        SSHPASS="$MPW" sshpass -e ssh-copy-id -o StrictHostKeyChecking=accept-new -i "$(nc_key).pub" -p "$mp" "$mu@$mh" >/dev/null 2>&1; unset MPW
+        if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$(nc_key)" -p "$mp" "$mu@$mh" true 2>/dev/null; then err "Key login to master failed (password/port?)"; pause; continue; fi
+        ok "Passwordless link to master works"
+        conf_set NC_HOST "$mh"; conf_set NC_PORT "$mp"; conf_set NC_USER "$mu"; conf_set NC_MODE push
+        ask "Node domain(s) hosted/issued on THIS server, space separated" doms ""; [[ -z "$doms" ]] && continue
+        nc_choose_method || { pause; continue; }
+        conf_set NC_DOMAINS "$doms"; conf_set NC_METHOD "$NC_M"
+        for d in $doms; do
+          n=$(nc_name "$d"); info "Issuing $d ..."
+          if [[ -f "/etc/letsencrypt/live/$n/fullchain.pem" ]] || nc_issue "$d" "$NC_M"; then nc_push "$n" && ok "$d delivered to master" || err "push failed for $d"; else err "$d: certificate failed"; fi
+        done
+        nc_show_paths; confirm "Enable weekly auto-renew + push now?" y && nc_enable_cron; pause ;;
+      3) nc_show_paths; pause ;;
+      4) nodecerts_job && ok "Done" || err "Finished with errors — see $LOG_FILE"; nc_show_paths; pause ;;
+      5) nc_enable_cron; pause ;;
+      6) rm -f /etc/cron.d/pg-m-nodecerts; for k in NC_DOMAINS NC_MODE NC_METHOD NC_HOST NC_PORT NC_USER NC_RESTART; do conf_del "$k"; done; rm -f "$PGM_DIR/cloudflare.ini"; ok "Removed (issued certs stay on disk)"; pause ;;
+      7) [[ "$(conf_get NC_RESTART)" == yes ]] && conf_set NC_RESTART no || conf_set NC_RESTART yes; ;;
+      0) break ;;
+    esac
   done
 }
 
@@ -2622,6 +2640,7 @@ case "${1:-menu}" in
                       restore_archive "$_arc" ;;
   --telegram-backup)  need_root; telegram_backup_job ;;
   --watchdog)         need_root; watchdog_job ;;
+  --node-certs)       need_root; nodecerts_job ;;
   update|--update)    need_root; self_update ;;
   *)                  usage; exit 1 ;;
 esac
